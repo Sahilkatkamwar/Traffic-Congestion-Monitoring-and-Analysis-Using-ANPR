@@ -1,0 +1,16 @@
+ultralytics
+opencv-python
+pillow
+numpy
+pandas
+pyyaml
+
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+
+rapidfuzz
+geopy
+albumentations
+fast-plate-ocr

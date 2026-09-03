@@ -1,0 +1,369 @@
+# Model weights. Paths resolve against the project root, never the cwd.
+#
+# A null entry is legitimate: the app runs anyway and falls back to the
+# pretrained default. Swapping a fine-tune in is an edit to this file and
+# nothing else -- these four lines are the whole interface between the training
+# track and the app.
+#
+# ocr is a .pt rather than the usual .onnx. fast-plate-ocr's trainer needs keras
+# and torch.onnx.export needs onnx; neither is installed and CLAUDE.md forbids
+# pip, so the fine-tune is PyTorch and app/ocr.py wraps it in the same
+# interface. Its alphabet and slot count live in ocr_best_plate_config.yaml
+# beside it. Measured on data/ocr/test: 62.5% exact vs the pretrained model's
+# 36.8% (scripts/eval_ocr.py).
+#
+# plate_detector is trained on data/plate_det's 181 scene images only. The other
+# 905 annotated images are already-cropped plates, and training on them taught
+# the detector that a plate fills the frame -- its median box covered 72% of a
+# vehicle crop against the stock model's 2%, and plate yield on real footage
+# fell. Measured over every clip in footage/: 43 plates of 280 sightings against
+# the stock model's 30 (scratch/p5_det_decide.py).
+#
+# vehicle_classes is still null, but the reason has changed. The classifier IS
+# trained now (models/finetuned/vehicle_cls_best.pt, and the better
+# vehicle_cls_aug.pt), and it is not adopted because its truck class is
+# collapsed: enabled, it relabels 23sec.mp4 -- a car park containing nothing but
+# cars -- as truck 42 / car 32 / bus 2, against the COCO fallback's car 72 /
+# truck 4. It would trade 72 correct labels for the 5 correct `auto` labels it
+# does earn. See CLAUDE.md, "Vehicle type classifier".
+#
+# There ARE vehicle bounding boxes now, in data/vehicle_det, added 2026-09-02.
+# They cannot fix the above -- that set has no `auto` class and labels
+# autorickshaws `car` -- and the detectors fine-tuned on them lost the
+# real-video A/B, so vehicle_detector stays on the COCO model. Both candidates
+# are in models/finetuned/ and the swap is one line here.
+models:
+  vehicle_detector: models/yolo11n.pt
+  plate_detector:   models/finetuned/plate_det_scenes.pt
+  vehicle_classes:  null
+  ocr:              models/finetuned/ocr_best.pt
+  # Appearance descriptor for re-identifying one physical vehicle across
+  # tracker fragmentation. null uses models/yolo11n-cls.pt, which is already on
+  # disk as the classifier's starting weights -- these are ImageNet features,
+  # not features trained for vehicle re-identification, and that ceiling is
+  # measured under "Re-identification" in CLAUDE.md.
+  reid_embedder:    null
+
+paths:
+  db:             data/anpr.db
+  crops:          crops/evidence
+  plate_crops:    crops/plates
+  unsorted_crops: crops/unsorted
+  # Videos and stills uploaded from the Sources screen. Inside footage/ because
+  # an uploaded clip is footage like any other.
+  uploads:        footage/uploads
+  # P4c. Annotated frames, crops and the result document for one Analyze job.
+  # Not evidence: nothing here belongs to a sighting, and a job's directory is
+  # deleted with the job. Kept out of crops/ for exactly that reason -- a crop
+  # under crops/evidence is a row's evidence and this is not.
+  analyze:        data/analyze
+
+server:
+  host: 127.0.0.1
+  port: 8000
+
+defaults:
+  frame_skip: 3          # process every Nth frame; too aggressive breaks tracking
+  imgsz: 640
+  conf: 0.35             # detection confidence floor
+  iou: 0.5
+  device: 0              # CUDA device index
+  tracker: bytetrack.yaml
+  vehicle_classes: [2, 3, 5, 7]   # COCO car, motorcycle, bus, truck
+  crop_pad: 0.04         # fraction of box size added around a saved crop
+  min_track_hits: 2      # a track seen once is noise, not a vehicle
+  track_timeout_frames: 45  # processed frames of absence before a track is emitted;
+                            # must exceed the tracker's track_buffer (30) or a
+                            # re-activated id arrives after its row was written
+  save_unsorted_crops: true # feeds the classifier dataset in TRAINING.md
+
+  # --- plate reading (P2) ---------------------------------------------------
+  # Plate detection runs on the vehicle crop, not the frame, so a plate found
+  # inside a tracked box already belongs to that track.
+  plate_imgsz: 640
+  # Lowered from 0.25 on 2026-09-02. Swept over 859 frozen vehicle crops from
+  # the five benchmark clips (scratch/inf/plate_sweep.py), counting Indian-clip
+  # survivors against false positives on the plate-less 23sec.mp4:
+  #     0.25 -> 20 kept, 0 FP      0.12 -> 36 kept, 0 FP
+  #     0.15 -> 32 kept, 0 FP      0.10 -> 37 kept, 0 FP
+  #     0.08 -> 39 kept, 2 FP      0.06 -> 43 kept, 3 FP
+  # False positives appear at 0.08, so 0.12 sits two steps clear of the edge
+  # and takes 36 of the 37 available. The shape and edge-density gates below
+  # are what suppress false positives, not this floor -- which is why it could
+  # be halved with the plate-less clip staying at exactly 0. On real video:
+  # plate reads 10 -> 12, false positives 0 -> 0.
+  plate_conf: 0.12          # plate detector confidence floor
+  min_plate_width: 48       # px; narrower than this the OCR model returns
+                            # confident nonsense, which is worse than no read
+  # Re-tested 2026-09-02 and kept. Lowering it does raise yield with no new
+  # false positives -- 48 -> 40 -> 32 gives 12 -> 14 -> 15 reads, all on the
+  # Indian clips -- but exact OCR and mean similarity to the hand labels do not
+  # move at any setting, and it actively damages a read that already worked:
+  # track 44 of 20260901_151758 goes from TN1KZI6575 at confidence 0.42 to
+  # CA22Z2115 at 0.21 to TS22Z2215 at 0.18, because the narrower crops it
+  # admits displace better views inside the five-sample vote. Unverifiable
+  # extra strings bought with a measurable regression is not a trade worth
+  # making, so this stays at 48.
+  plate_min_vehicle_px: 80  # skip plate detection on a vehicle box this small
+  # Shape sanity, applied before confidence. On a vehicle crop this detector
+  # regularly returns a confident box around the whole crop; without these the
+  # OCR model is handed a picture of a car and answers anyway.
+  #
+  # Every number here was measured on 23 hand-labelled detections from
+  # footage/session01 -- 7 real plates, 16 things that were not plates -- and
+  # each is set to keep all 7 while removing as many of the 16 as it can.
+  max_plate_area_frac: 0.06  # real plates covered 0.36-3.7% of the vehicle box;
+                             # the rear windscreens it mistook for plates
+                             # covered 10-15%. The old 0.35 excluded nothing.
+  min_plate_area_frac: 0.0005  # below this it is a smudge, not a plate
+  min_plate_aspect: 1.1      # plates are wider than tall, two-row ones included
+  max_plate_aspect: 6.5      # was 10.0; nothing that long is a plate
+  # Fraction of the box covered by strong edges -- character strokes. Over 12
+  # real plates and 16 false positives from footage/session01, every real plate
+  # scored 0.288+ and 7 false positives scored 0.174 or less, with a clean gap
+  # between; this sits in the gap. Greyscale contrast was tried first and is in
+  # the history for a reason: it scores the faded yellow MP09ZS0907 at 21,
+  # below every false positive in the set, so any useful threshold threw away a
+  # plate the detector had found at 0.89 confidence in twenty frames running.
+  min_plate_edge_density: 0.22
+  plate_min_y_frac: 0.30     # a plate sits low on a vehicle from every angle.
+                             # A windscreen does not. Measured from the box
+                             # centre, as a fraction of the vehicle crop.
+  # Two-row plates are read wrong as one line -- MH17C over Y4718 comes back as
+  # MH77IVX183, because the OCR model has only ever seen one row. Splitting the
+  # crop in two fixes that plate and the mechanism always worked. What did not
+  # work was deciding *which* plates to split from the shape of the box: over
+  # the seven hand-labelled plates in footage/session01 the genuine two-row
+  # plate has a tight box aspect of 1.51 while two single-row plates measure
+  # 1.31 and 1.89, so no threshold separates them, and an ink-profile test does
+  # no better because the dark bumper around a padded single-row plate forms the
+  # same two bands. Splitting on that guess turned MH15HY2237 into
+  # PN71A22278MH01B0033.
+  #
+  # Turned ON 2026-09-02, after two findings changed the mechanism.
+  #
+  # First: reading the two halves separately does not work, and the cause is the
+  # OCR model, not the cut. fast-plate-ocr emits a fixed slot count and has only
+  # seen single-row plates, so handed a five-character row it invents eight. Over
+  # 30 combinations of cut point, trim and upscale on the known MH17CY4718 crop
+  # (scratch/inf/tworow_probe.py), the halves read as things like MH4K7017 and
+  # TR4T1888 and NONE of the 30 produced the plate. What works instead is laying
+  # the two rows side by side into one line -- the shape the model was trained
+  # on. The same crop then reads MH17CI4718, one character from the truth.
+  #
+  # Second: the decision of whether to split no longer comes from the picture.
+  # Both readings run and app/ocr.py:_choose_rows takes the rearranged one only
+  # when it parses as a real registration AND the one-line read does not. That
+  # asymmetry is the safety argument: a stitched crop nearly always produces
+  # something plate-shaped, so validity of the two-row read is weak evidence on
+  # its own, while "the one-line read is not a plate in any layout" is strong.
+  # MH77AVX183 is not a plate; MH17CI4718 is. A plate already read as a valid
+  # registration cannot be touched, which is what makes this safe to leave on.
+  #
+  # two_row_aspect is now only a cheap prefilter choosing which crops are worth
+  # reading more than once, not a decision, so it is set wide. A wrong guess
+  # costs three extra OCR images inside a batch that runs at most five times per
+  # track.
+  #
+  # Measured over the five clips: mean similarity to the hand labels 0.657 ->
+  # 0.750, MH17CY4718 0.47 -> 0.70, MP09ZS0907 0.27 -> 0.40, the two plates that
+  # already read correctly unchanged, false positives on 23sec.mp4 still 0.
+  # Exact OCR did NOT move -- it is still 1/4.
+  # Applied to every plate crop just before OCR. See app/ocr.py:preprocess.
+  # OFF, and this is a measured negative result worth keeping.
+  #
+  # Read one crop at a time, greynorm_x2 looks clearly best: over the three
+  # benchmark plates carrying a hand label (scratch/inf/preproc_probe.py) it
+  # scores mean similarity 0.888 against native's 0.755, with clahe 0.822 and
+  # plain x2 0.788. On the full five-clip benchmark it is a **regression**:
+  # mean similarity 0.750 -> 0.708. It helps the plate it was winning on
+  # (MH17CY4718 0.70 -> 0.77) and damages the other two -- MH15HY2237 falls
+  # 0.90 -> 0.80 and the MP09ZS0907 vehicle drops back from 0.40 to 0.27.
+  #
+  # The gap between the two measurements is the point. The per-crop probe reads
+  # one view once; the pipeline reads five views and votes. Normalising each
+  # view independently makes the five *more alike* -- it removes exactly the
+  # exposure differences that made them independent opinions -- so the vote has
+  # less to work with and its errors correlate. A preprocessing step is not
+  # allowed to be judged on a single crop for that reason.
+  plate_preprocess: none
+  two_row_split: true
+  two_row_aspect: 2.2
+  # Plate crops are cut from the frame, not from the vehicle crop, so this
+  # padding can run past the edge of the vehicle box -- which is where the
+  # missing characters were. It is applied ONLY to a side of the plate box that
+  # is touching the side of the vehicle box, because that is the side that got
+  # cut; a plate sitting comfortably inside its vehicle box is cropped exactly
+  # as tightly as before. Padding every side unconditionally was measured and
+  # is worse: MH15HY2237 read as MH15HY2277 tight and JK11B2217 padded.
+  plate_crop_pad_x: 0.08
+  plate_crop_pad_y: 0.14
+  plate_samples: 5          # best reads kept and voted per track, widest first
+  plate_every: 2            # processed frames between OCR attempts on one track,
+                            # so the votes come from different views not one blur
+  plate_max_attempts: 30    # ceiling on plate detections per track. Attempts are
+                            # only spent on the closest views of a vehicle, so a
+                            # long track does not burn its budget at a distance
+  plate_candidates_k: 5     # top-k alternatives stored for P3 fuzzy matching
+  min_plate_chars: 4        # a shorter read is not a plate
+  ocr_model: cct-s-v2-global-model  # used only while models.ocr is null
+  # auto / cuda / cpu. `auto` asks for CUDA and accepts CPU without complaint;
+  # `cuda` asks and says loudly if it does not get it; `cpu` does not ask.
+  #
+  # onnxruntime never raises when its CUDA provider fails to load -- it returns
+  # a CPU session -- so the device is verified after the session is built, and
+  # the startup line reports what OCR actually runs on.
+  #
+  # Verified 2026-09-01 on this machine: it runs on CPU. onnxruntime-gpu 1.29.0
+  # is the CUDA 13 build and hard-requires cublas64_13.dll / cublasLt64_13.dll;
+  # only CUDA 12.8 is installed. The driver (CUDA 13.4) and cuDNN 9 are both
+  # fine, so cuBLAS 13 is the single missing piece. OCR runs once per track,
+  # not per frame, so the cost is small.
+  ocr_device: auto
+
+  # --- track stitching (inference hardening) --------------------------------
+  # ByteTrack hands out a new id whenever it loses confidence, and every one of
+  # those is a duplicate row. See app/stitch.py for what each mechanism does.
+  # These are deliberately conservative: a missed stitch is a visible duplicate,
+  # a wrong stitch silently merges two vehicles into one trajectory.
+  stitch_overlap: 0.55        # IoU-or-containment for two ids in ONE frame
+  stitch_max_gap_frames: 25   # processed frames a track may be missing and
+                              # still be reconnected to
+  stitch_max_move_boxes: 2.0  # how far past its predicted position a
+                              # reappearing vehicle may be, in box widths
+  stitch_min_size_ratio: 0.5  # a vehicle does not halve in size across a gap
+  stitch_min_appearance: 0.45 # hue/saturation histogram correlation
+  stitch_plate_similarity: 0.86  # two finished tracks reading this alike are
+                                 # one vehicle, whatever the geometry says
+
+  # --- re-identification: one physical vehicle, no plate ---------------------
+  # The gap the three mechanisms above cannot reach: a vehicle leaves the frame
+  # and comes back, carrying no plate to tie the fragments together. On this
+  # footage that is most of the remaining duplication -- the parked
+  # black-and-yellow autorickshaw in 20260901_151758.mp4 was written five times.
+  #
+  # This does NOT loosen anything above. stitch_max_gap_frames stays at 25;
+  # these are separate gates on a separate mechanism that only runs on finished
+  # tracks, and it is gated first on a physical fact rather than a threshold:
+  # two tracks whose lifetimes overlap are two vehicles, because one vehicle
+  # cannot be in two places at once.
+  #
+  # That veto is what makes the similarity threshold safe. Measured on
+  # 20260901_151758.mp4 (scratch/inf/reid_probe.py): a dark motorcycle and a
+  # white scooter that are plainly different vehicles score 0.937, HIGHER than
+  # the white Swift's own front and rear views of itself at 0.939. No appearance
+  # threshold separates those. The clock separates them for nothing -- both are
+  # in frame at 09:00:25.
+  #
+  # 0.97 was then set on the hardest over-merge test available: 23sec.mp4, a
+  # dashcam driving past a car park, 76 rows of similar vehicles and no plates.
+  # At 0.97 it makes exactly 2 merges and both are the same white Ford pickup
+  # seen three times. At 0.96 it also merges cars that are visibly different.
+  stitch_reid_similarity: 0.97   # cosine between yolo11n-cls embeddings
+  stitch_reid_window_sec: 45.0   # how long a vehicle may be gone and still be
+                                 # re-acquired. Long on purpose -- that is the
+                                 # point -- but bounded, because over a long
+                                 # stream every dark hatchback eventually finds
+                                 # a partner.
+
+  # --- candidate: concurrent fragmentation, one place written twice ---------
+  # ON since 2026-09-03. See app/stitch.py:footprint_twin and CLAUDE.md,
+  # "Concurrent fragmentation" for how it works -- the paragraphs below are the
+  # case that was made for it while it was still a candidate, and every number
+  # in them reproduced on the eight-clip re-run that adopted it.
+  #
+  # The gap the four mechanisms above cannot reach, and cannot be *made* to
+  # reach by moving a threshold: ByteTrack holding two simultaneous ids on one
+  # vehicle. Those two tracks overlap in time, so stitch_reid_similarity's
+  # clock veto refuses them however high or low it is set; and the tracker is
+  # reporting both ids in the same frame, so stitch_overlap's seen_this_frame
+  # rule refuses them too. Nothing here loosens either: reid stays 0.97,
+  # stitch_max_gap_frames stays 25, and this mechanism reads neither.
+  #
+  # It runs last, only on pairs the plate and re-identification passes have
+  # already declined, and it merges only when the two tracks were the SAME BOX
+  # on every frame both were reported -- one frame apart is a veto, because one
+  # frame apart is one vehicle each. Measured on the nine session01 clips:
+  # 4 merges, 392 rows -> 388, all four confirmed against the source frames as
+  # one physical vehicle written twice, zero false merges, and the one
+  # hand-labelled distinct pair in the set (vdopov4 tracks 8 and 20, which an
+  # ImageNet embedding scores 0.968) refused on geometry alone.
+  #
+  # Every threshold below sits on a plateau rather than an edge: swept one at a
+  # time over the nine clips, min_iou 0.5-0.90, iou 0.80-0.90, size_ratio
+  # 0.6-0.9, max_drift 0.01-0.10, min_cover 0.0-1.0 and appearance 0.0-0.80 all
+  # produce the identical four merges.
+  # --- candidate: an adoption the tracker itself disproves -----------------
+  # OFF. Candidate, production does not run it. See app/stitch.py:revoke_aliases
+  # and CLAUDE.md, "adopt(): identity pollution".
+  #
+  # adopt() decides from one frame whether a new tracker id continues a track we
+  # already have. Replayed over data/vehicle_mot_output -- 31575 processed
+  # frames, 8633 adoptions, footage this project has never tuned on -- 313 of
+  # those adoptions (3.6%) are proved wrong by the tracker itself: it goes on to
+  # report the adopted id and an id already in the same chain in ONE frame, on
+  # boxes that barely touch.
+  #
+  # Nothing at the moment of the decision separates them. Overlap, size ratio
+  # and centre distance have the same distribution in the wrong 313 as in the
+  # right 8320, and an overlap floor removing 189 of the 313 also removes 5000
+  # of the 8320 (scratch/final/adopt_analyse.py). So this does not change the
+  # decision or any threshold it reads. It uses the later evidence instead, and
+  # only ever SPLITS: it cannot create a false merge.
+  #
+  # Measured over the same frames (scratch/final/adopt_pollution.py), with a
+  # freed id never adopted again: frames of a foreign vehicle sitting inside a
+  # row 1250 -> 416, rows 2489 -> 2620. The rows rise because a false merge
+  # coming apart is two rows where there was one, which is the correct answer.
+  # ADOPTED 2026-09-03 after the eight-clip benchmark. 53 revocations, every
+  # one of them two boxes the tracker reported in ONE frame with overlap 0.0 to
+  # 0.29; 16 were drawn back onto the footage they came from
+  # (scratch/final/revocations.jpg, revocations_indian.jpg) and all 16 are two
+  # plainly different vehicles -- a white car and a Chevy pickup, a red MSRTC
+  # bus and a loading tempo. Zero false splits.
+  #
+  # Rows 380 -> 417. The rise is the point: each is a vehicle that production
+  # currently does not report at all, because adopt() folded it into another
+  # vehicle's row. Plate reads 13 -> 14, and the read it loses is the 50x24px
+  # AP4H4111 on vdo.avi that CLAUDE.md already records as a false read.
+  # False positives on the plate-less 23sec.mp4 stay 0, raw detections and
+  # tracker ids are identical clip for clip, and every worker ended `done`.
+  stitch_alias_revoke: true
+
+  #
+  # ADOPTED 2026-09-03. The five merges below are byte-identical to the ones
+  # CLAUDE.md already reviewed frame by frame and confirmed as one physical
+  # vehicle written twice, and they reproduce unchanged alongside
+  # stitch_alias_revoke. Residual duplication bound 17 rows -> 14.
+  stitch_footprint: true
+  stitch_footprint_min_frames: 2    # processed frames both tracks were reported
+  stitch_footprint_min_iou: 0.85    # EVERY shared frame must reach this
+  stitch_footprint_iou: 0.90        # mean over the shared frames
+  stitch_footprint_min_cover: 0.80  # shared frames / the shorter track's life
+  stitch_footprint_size_ratio: 0.80 # two boxes on one object are one size
+  stitch_footprint_max_drift: 0.03  # wobble of the centre-to-centre vector, in
+                                    # box widths; a passing vehicle sweeps
+  stitch_footprint_appearance: 0.80 # a veto, never the decision. On the nine
+                                    # clips it never binds -- 0.0 gives the
+                                    # same four merges.
+
+  # --- analyze, the standalone screen (P4c) ---------------------------------
+  # An Analyze job runs the same detector, tracker, stitcher and plate reader a
+  # source worker runs, on a file nobody has to add as a source. These two
+  # settings are the only thing it does differently, and both are about the
+  # scrubbable timeline rather than about detection.
+  #
+  # One annotated frame is written per processed frame so the scrubber shows
+  # exactly what the pipeline saw rather than an interpolation of it. That is
+  # bounded: 667 processed frames of a 200s clip at 720px is about 35 MB, and a
+  # long clip would otherwise fill the disk. Past the cap the annotated frames
+  # are strided uniformly and the job reports the stride -- the DETECTIONS are
+  # never strided, only the pictures of them.
+  analyze_max_frames: 600
+  analyze_frame_width: 720
+
+  # --- vehicle type classifier ----------------------------------------------
+  # Only consulted when models.vehicle_classes is set. Below the floor the
+  # classifier abstains and the detector's COCO label stands.
+  vehicle_cls_imgsz: 128
+  vehicle_cls_conf: 0.55

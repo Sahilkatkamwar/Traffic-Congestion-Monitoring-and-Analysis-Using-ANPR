@@ -1,0 +1,41 @@
+# Seed sources, loaded once into the sources table on a first run.
+#
+# After that first run sources are runtime state managed from the UI and this
+# file is ignored -- re-reading it would resurrect a source the user deleted.
+#
+# start_time is the wall-clock moment the recording began. It is what turns a
+# frame index into an absolute timestamp, so every trajectory and travel-time
+# number depends on it: set the real recording time, not an approximation.
+#
+# lat / lon are left unset. Sources are placed on the map from the UI in P4b,
+# and a guessed coordinate is worse than none -- it would draw a trajectory
+# through a road that does not exist.
+
+sources:
+  - source_id: cam01
+    name: Clip 20s
+    kind: file
+    uri: footage/clips/20 sec.mp4
+    frame_skip: 3
+    start_time: 2026-08-31T09:00:00Z
+
+  - source_id: cam02
+    name: Session 01 10s
+    kind: file
+    uri: footage/session01/10 sec.mp4
+    frame_skip: 3
+    start_time: 2026-08-31T09:05:00Z
+
+# A live camera looks like this. Uncomment to have one start with the app:
+#
+#   - source_id: cam03
+#     name: Laptop webcam
+#     kind: webcam
+#     uri: 0                 # a webcam index, quoted or not
+#     frame_skip: 3
+#
+#   - source_id: cam04
+#     name: Phone
+#     kind: network
+#     uri: http://192.168.1.7:8080/video
+#     frame_skip: 3

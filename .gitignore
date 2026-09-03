@@ -1,0 +1,27 @@
+env/
+__pycache__/
+*.pyc
+
+# Runtime state
+data/anpr.db
+data/anpr.db-wal
+data/anpr.db-shm
+crops/evidence/
+crops/unsorted/
+runs/
+scratch/
+crops/
+
+# Weights and media
+weights/
+*.pt
+footage/
+data/ocr/
+data/raw/
+data/vehicle_cls/
+data/
+models/
+
+# Frontend
+web/node_modules/
+web/dist/

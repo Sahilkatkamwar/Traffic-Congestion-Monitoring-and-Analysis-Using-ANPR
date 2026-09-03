@@ -1,0 +1,135 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens.
+ *
+ * The palette comes from Indian number plates, which already encode meaning:
+ * white ground private, yellow commercial, green electric, red government.
+ * Plate yellow is the accent. A colour in this file is only ever spent on
+ * something it means -- nothing here is available for decoration.
+ *
+ * The base is a deep desaturated slate rather than black so that map tiles and
+ * video sit on it without vibrating. */
+:root {
+  --surface-0: #0f1319;   /* app ground */
+  --surface-1: #161d26;   /* cards */
+  --surface-2: #1f2833;   /* raised, hover */
+  --surface-3: #2a3543;   /* controls, chips */
+
+  --ink-hi:  #e9eef4;
+  --ink-mid: #98a5b3;
+  --ink-low: #66727f;
+
+  --plate-white:  #f2f3ee;
+  --plate-yellow: #f5c518;
+  --plate-green:  #12a45c;
+  --plate-red:    #d34331;
+
+  /* One hairline is worth five boxes. */
+  --hairline: rgba(255, 255, 255, 0.075);
+
+  /* Elevation instead of borders. */
+  --shadow-float: 0 18px 48px -12px rgba(0, 0, 0, 0.72);
+  --shadow-lift:  0 6px 18px -8px rgba(0, 0, 0, 0.6);
+
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system,
+    sans-serif;
+  /* Condensed grotesque, so a plate reads as evidence and not as table text.
+   * Arial Narrow ships with Windows, so this degrades without a web font. */
+  --font-plate: "Roboto Condensed", "Arial Narrow", "Segoe UI", system-ui,
+    sans-serif;
+
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--surface-0);
+  color: var(--ink-hi);
+  font-family: var(--font-sans);
+  font-size: 14.5px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Focus must be visible everywhere it can land. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--plate-yellow);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+@layer components {
+  /* Small uppercase letter-spaced label. The counterweight to the large
+   * numerals -- the type scale needs both ends or everything reads as 12px. */
+  .label {
+    @apply text-label uppercase font-semibold text-ink-low;
+  }
+
+  /* Only panels floating over the map are blurred. Nothing else. */
+  .glass {
+    background: color-mix(in srgb, var(--surface-1) 84%, transparent);
+    backdrop-filter: blur(18px) saturate(1.25);
+    -webkit-backdrop-filter: blur(18px) saturate(1.25);
+    box-shadow: var(--shadow-float);
+  }
+
+  .hairline-t {
+    border-top: 1px solid var(--hairline);
+  }
+}
+
+/* Leaflet sits on our ground, not its own. */
+.leaflet-container {
+  background: var(--surface-0);
+  font-family: var(--font-sans);
+}
+.leaflet-control-attribution {
+  background: rgba(15, 19, 25, 0.78) !important;
+  color: var(--ink-low) !important;
+  font-size: 10px !important;
+}
+.leaflet-control-attribution a {
+  color: var(--ink-mid) !important;
+}
+.leaflet-bar a {
+  background: var(--surface-2) !important;
+  color: var(--ink-hi) !important;
+  border-color: var(--hairline) !important;
+}
+
+/* A source marker pulses only while it is emitting. */
+@keyframes marker-pulse {
+  0%   { transform: scale(1);   opacity: 0.55; }
+  70%  { transform: scale(2.6); opacity: 0; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+.marker-pulse {
+  animation: marker-pulse 1.6s ease-out infinite;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: 999px;
+  border: 3px solid var(--surface-0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .marker-pulse { display: none; }
+}
