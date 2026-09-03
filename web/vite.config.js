@@ -14,6 +14,7 @@ export default defineConfig({
     proxy: {
       '/api': { target: 'http://127.0.0.1:8000', ws: true },
       '/crops': { target: 'http://127.0.0.1:8000' },
+      '/media': { target: 'http://127.0.0.1:8000' },
     },
   },
 })

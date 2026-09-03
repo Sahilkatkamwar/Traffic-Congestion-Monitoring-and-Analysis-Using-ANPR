@@ -64,6 +64,12 @@ PROGRESS_EVERY_SEC = 0.4
 # also swept at startup.
 MAX_JOBS = 12
 
+# Where a job's frames and crops are served from. NOT `/analyze`: that is the
+# frontend's own route, and a StaticFiles mount there would swallow
+# /analyze/<job_id> -- a deep link into the screen -- and answer 404 instead of
+# letting it fall through to the SPA.
+MEDIA_PREFIX = "/media/analyze"
+
 
 def _seconds(ts):
     """A track timestamp back to seconds from the start of the media."""
@@ -216,7 +222,7 @@ def run_analysis(job, out, stop_event):
             tail = Path(rel).resolve().relative_to(out_dir.resolve()).as_posix()
         except ValueError:
             return None
-        return f"/analyze/{job_id}/{tail}"
+        return f"{MEDIA_PREFIX}/{job_id}/{tail}"
 
     def say(**message):
         try:
@@ -233,6 +239,7 @@ def run_analysis(job, out, stop_event):
         from app.detect import VehicleDetector
         from app.ocr import PlateReader
         from app.worker import (
+            RETIRE_TTL_FRAMES,
             _crop,
             _open_capture,
             _probe,
@@ -304,7 +311,19 @@ def run_analysis(job, out, stop_event):
         stride = 1
 
         def emit(track):
-            """A track the tracker has stopped reporting, resolved and kept."""
+            """A track the tracker has stopped reporting, resolved and kept.
+
+            The three twin passes run in the worker's order and for the worker's
+            reasons: a shared registration is the strongest claim, a clean
+            re-acquisition is next, and the footprint rule only ever sees pairs
+            the first two declined.
+
+            A track can be emitted twice -- the tracker re-activates an id after
+            it timed out -- and that is an update, not a second vehicle. The
+            worker expresses that by writing to the same row; here the finished
+            tracks are collapsed by track_id at the end, which is the same
+            statement.
+            """
             nonlocal stitched
             _finalise_analysis(track, dirs, plate_opts, classifier)
             twin = stitcher.plate_twin(track, retired)
@@ -318,6 +337,15 @@ def run_analysis(job, out, stop_event):
                 track.track_id = twin
             retired[track.track_id] = track
             finished.append(track)
+            # The crops are on disk now. Holding the pixels for every finished
+            # track is how a 200s clip runs the process out of memory; the reads
+            # stay, because a re-activated track keeps voting on them.
+            track.best_crop = None
+            track.best_plate_crop = None
+            if len(retired) > 512:
+                cutoff = processed - RETIRE_TTL_FRAMES
+                for tid in [t for t, r in retired.items() if r.last_index < cutoff]:
+                    del retired[tid]
 
         if is_image:
             say(type="stage", stage="running", detail="Reading the image")
@@ -359,7 +387,7 @@ def run_analysis(job, out, stop_event):
                     "i": 0,
                     "frame": 0,
                     "seconds": 0.0,
-                    "image": f"/analyze/{job_id}/frames/000000.jpg",
+                    "image": f"{MEDIA_PREFIX}/{job_id}/frames/000000.jpg",
                     "width": size[0] if size else width,
                     "height": size[1] if size else height,
                     "boxes": [
@@ -496,7 +524,7 @@ def run_analysis(job, out, stop_event):
                                 "i": n,
                                 "frame": here,
                                 "seconds": round(here / fps, 3),
-                                "image": f"/analyze/{job_id}/frames/{name}",
+                                "image": f"{MEDIA_PREFIX}/{job_id}/frames/{name}",
                                 "width": size[0] if size else width,
                                 "height": size[1] if size else height,
                                 "boxes": [

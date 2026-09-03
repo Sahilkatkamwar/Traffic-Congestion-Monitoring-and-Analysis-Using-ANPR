@@ -93,6 +93,27 @@ export function uploadFile(file, onProgress) {
   })
 }
 
+// --- analyze (P4c) ---------------------------------------------------------
+//
+// Analyze is standalone: none of these touch a source, and an analysis never
+// becomes a sighting. A job is accepted with 202 and polled until it finishes,
+// because a video takes as long as the video is.
+
+export const startAnalysis = (uri, frameSkip) =>
+  post('/api/analyze', { uri, frame_skip: frameSkip })
+export const getAnalysis = (id) => get(`/api/analyze/${encodeURIComponent(id)}`)
+export const listAnalyses = () => get('/api/analyze')
+export const cancelAnalysis = (id) =>
+  post(`/api/analyze/${encodeURIComponent(id)}/cancel`)
+export const deleteAnalysis = (id) =>
+  send(`/api/analyze/${encodeURIComponent(id)}`, { method: 'DELETE' })
+
+// A download, not a fetch: the server sets Content-Disposition and the browser
+// saves it. Building the file in JS would mean holding a whole result document
+// in a blob for no gain.
+export const exportUrl = (id, format) =>
+  `/api/analyze/${encodeURIComponent(id)}/export.${format}`
+
 // crop_path is stored relative to the project root ('crops/evidence/...') and
 // FastAPI mounts that directory at /crops, so the stored value is the URL.
 export const cropUrl = (path) => (path ? `/${path}` : null)

@@ -16,6 +16,7 @@ the second writer the whole design exists to avoid.
 """
 
 import asyncio
+import json
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -34,11 +35,12 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    Response,
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
 
-from app import config, db, probe, sources as source_rules
+from app import analyze as analysis, config, db, probe, sources as source_rules
 from app.stream import Hub
 
 # Long enough to stay quiet on an idle feed, short enough that a browser that
@@ -99,18 +101,24 @@ npm run build</code></pre>
 
 def create_app(pipeline=None):
     hub = Hub()
+    # Independent of the pipeline on purpose: the Analyze screen has to work
+    # with zero cameras configured, so its job runner is not something a source
+    # switches on.
+    jobs = analysis.AnalysisJobs()
 
     @asynccontextmanager
     async def lifespan(app):
         # Bind before the workers start, or the first sightings are published
         # into a hub that has no loop to schedule them on.
         hub.bind_loop(asyncio.get_running_loop())
+        jobs.start()
         if pipeline is not None:
             pipeline.on_event = hub.publish
             pipeline.start()
         yield
         if pipeline is not None:
             pipeline.shutdown()
+        jobs.shutdown()
 
     app = FastAPI(
         title="ANPR City",
@@ -120,6 +128,7 @@ def create_app(pipeline=None):
     )
     app.state.pipeline = pipeline
     app.state.hub = hub
+    app.state.jobs = jobs
 
     # ------------------------------------------------------------------- api
 
@@ -648,6 +657,102 @@ def create_app(pipeline=None):
         finally:
             hub.unregister(queue)
 
+    # ---------------------------------------------------------------- analyze
+
+    # Standalone by design. Nothing in this section touches the sources table or
+    # the writer, and no analysis ever becomes a sighting -- see the module
+    # docstring in app/analyze.py for why that separation is load-bearing rather
+    # than tidy. The screen works with zero cameras configured because there is
+    # nothing here for a camera to configure.
+
+    @app.post("/api/analyze", status_code=202)
+    def start_analysis(payload: dict = Body(...)):
+        """Queue one file for analysis.
+
+        202 rather than 201: a job is accepted here and finished later, and a
+        video takes as long as it takes. The client polls the job.
+        """
+        frame_skip = payload.get("frame_skip")
+        try:
+            frame_skip = None if frame_skip is None else int(frame_skip)
+        except (TypeError, ValueError):
+            return fail(400, "frame_skip must be a whole number of frames.")
+        if frame_skip is not None and not 1 <= frame_skip <= 60:
+            return fail(400, "frame_skip must be between 1 and 60.")
+
+        job, error = jobs.submit(
+            payload.get("uri"), frame_skip=frame_skip, name=payload.get("name")
+        )
+        if error is not None:
+            return fail(400, error)
+        return job
+
+    @app.get("/api/analyze")
+    def list_analyses(limit: int = Query(25, ge=1, le=100)):
+        return jobs.list(limit)
+
+    @app.get("/api/analyze/{job_id}")
+    def get_analysis(job_id: str):
+        """One job, carrying its full result once it has one.
+
+        The result is only attached when the job is done, so a client polling a
+        running job gets the small document every time and the large one once.
+        """
+        job = jobs.view(job_id)
+        if job is None:
+            return fail(404, f"There is no analysis job {job_id}.")
+        document = jobs.result(job_id)
+        return {**job, "result": document}
+
+    @app.post("/api/analyze/{job_id}/cancel")
+    def cancel_analysis(job_id: str):
+        ok, error = jobs.cancel(job_id)
+        if not ok:
+            return fail(409, error)
+        return jobs.view(job_id)
+
+    @app.delete("/api/analyze/{job_id}", status_code=204)
+    def delete_analysis(job_id: str):
+        if not jobs.delete(job_id):
+            return fail(404, f"There is no analysis job {job_id}.")
+        return Response(status_code=204)
+
+    @app.get("/api/analyze/{job_id}/export.{fmt}")
+    def export_analysis(job_id: str, fmt: str):
+        """The detections as JSON or CSV, as a download.
+
+        The whole result document for JSON -- media, parameters, per-frame boxes
+        and vehicles -- because an export that drops the settings it was produced
+        under cannot be checked later. CSV is the vehicles only: a per-frame box
+        list is not a table and pretending it is helps nobody.
+        """
+        if fmt not in ("json", "csv"):
+            return fail(404, "Export is available as json or csv.")
+        job = jobs.view(job_id)
+        if job is None:
+            return fail(404, f"There is no analysis job {job_id}.")
+        document = jobs.result(job_id)
+        if document is None:
+            return fail(
+                409,
+                f"That analysis has not finished (it is {job['status']}). There "
+                f"is nothing to export yet.",
+            )
+        stem = Path(document.get("name") or job_id).stem or job_id
+        filename = source_rules.safe_filename(f"{stem}_detections.{fmt}")
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        if fmt == "csv":
+            return Response(
+                content=analysis.to_csv(document),
+                media_type="text/csv; charset=utf-8",
+                headers=headers,
+            )
+        return Response(
+            content=json.dumps(document, indent=2),
+            media_type="application/json",
+            headers=headers,
+        )
+
     # ---------------------------------------------------------------- statics
 
     # Evidence crops. sightings.crop_path is stored relative to the project
@@ -657,6 +762,15 @@ def create_app(pipeline=None):
     crops_root = config.ROOT / "crops"
     crops_root.mkdir(parents=True, exist_ok=True)
     app.mount("/crops", StaticFiles(directory=crops_root), name="crops")
+
+    # Analyze job frames and crops. Under /media rather than /analyze because
+    # /analyze is the frontend's own route and a mount there would answer 404
+    # for /analyze/<job_id> instead of letting the SPA fallback serve it.
+    analyze_root = config.analyze_dir()
+    analyze_root.mkdir(parents=True, exist_ok=True)
+    app.mount(
+        analysis.MEDIA_PREFIX, StaticFiles(directory=analyze_root), name="analyze"
+    )
 
     # ------------------------------------------------------------ spa (last)
 

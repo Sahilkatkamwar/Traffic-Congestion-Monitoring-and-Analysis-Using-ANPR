@@ -1347,3 +1347,217 @@ is untouched — that directory is a deliberate harvest for the classifier, not
 evidence for a row.
 
 Ready for P4c.
+
+---
+
+# P4c - Analyze
+
+P4c complete. Server stopped, port released.
+
+## Exit criteria - verified
+
+> *dropping an unseen image returns annotated detections with plate reads*
+
+`scratch/p4c_verify.py`, **75 checks passed, 0 failed, 0 skipped, 23s**
+(`scratch/p4c/p4c_verify.log`). It starts the app once with **no pipeline and a
+database holding no sources** — which is the "works with zero cameras
+configured" criterion itself rather than a simulation of it, because if any part
+of Analyze needed a worker, a writer or a source the script could not start at
+all — and then does everything a browser does, over HTTP.
+
+The image the exit criterion names is frame 120 of `footage/clips/20 sec.mp4`,
+cut to a png by the script and uploaded through `/api/uploads` exactly as a drop
+on the screen would. What came back:
+
+| check | result |
+|---|---|
+| detections on an uploaded still | 2 boxes, both in range as fractions of the frame |
+| each box carries a type and a confidence | yes |
+| one vehicle per detection, never one per frame | 2 vehicles, 2 boxes |
+| evidence crop per vehicle, and it serves | yes, both |
+| **a plate was read** | **`MH05BY2207` at 0.62** |
+| the read carries its confidence | yes |
+| raw read kept beside the corrected one | yes |
+| checked against the plate grammar | valid, state Maharashtra |
+| plate crop saved, and it serves | yes |
+| candidates stored for fuzzy matching | 1 |
+| a vehicle with no plate is still reported | 1 of the 2 |
+
+`MH05BY2207` is a **one-frame read** and is not offered as an accuracy figure.
+The hand label for that vehicle is `MH15HY2237`, and the multi-frame vote over
+the same clip reads `MH15HY2277` — see the video section below, which is the
+number comparable to anything else in this repo. A single still has one view and
+cannot vote, and the screen says so by showing `voted over 1 frame`.
+
+### The control, because a read is only worth what its false-positive rate is
+
+A still from `footage/session01/23sec.mp4` — the plate-less US car park this
+repo uses as its control — was analysed the same way: **12 vehicles detected, 0
+plates read.** The zero-false-positive property the pipeline has on that clip
+survives into Analyze, which it must, because Analyze is running the same
+filters.
+
+## What was built
+
+| file | what |
+|---|---|
+| `app/analyze.py` | new. The analysis child, the job runner, and the CSV export |
+| `app/api.py` | 6 analyze routes and the `/media/analyze` static mount |
+| `app/stitch.py` | `TrackStitcher.from_config()` — extracted, see below |
+| `app/worker.py` | uses it; 40 lines of thresholds removed, nothing else |
+| `app/config.py` | `analyze_dir()`, created by `ensure_dirs()` |
+| `config/settings.yaml` | `paths.analyze`, `analyze_max_frames`, `analyze_frame_width` |
+| `web/src/screens/AnalyzeScreen.jsx` | was an 11-line placeholder; now the screen |
+| `web/src/components/AnalyzeViewer.jsx` | new. Frame, overlaid boxes, scrubber |
+| `web/src/lib/api.js` | the analyze calls |
+| `web/vite.config.js` | `/media` added to the dev proxy |
+
+## Analyze is the pipeline, and that is measured rather than asserted
+
+The module claims to be "the same pipeline pointed at a file" rather than a
+second implementation of it. `scratch/p4c/parity.py` is what that claim is worth:
+one clip through `scratch/bench_realvideo.py`, which runs a real worker and
+writes real sightings, against the same clip through an analysis child, which
+writes none.
+
+`footage/clips/20 sec.mp4`, production configuration, every field compared:
+
+| | pipeline | analyze |
+|---|---|---|
+| processed frames | 208 | 208 |
+| raw detections | 207 | 207 |
+| tracker ids | 16 | 16 |
+| stitches applied | 5 | 5 |
+| rows / vehicles | 11 | 11 |
+| with a plate crop | 2 | 2 |
+| with a plate read | 2 | 2 |
+| plates | `MH15HY2277` 0.6019 voted 3, `PB61V6819` 0.3145 voted 1 | identical |
+| types | motorcycle 4, truck 4, car 2, bus 1 | identical |
+
+**Identical on every count, both plate strings, both confidences to four
+decimals, both vote sizes, and the type distribution.** That is the whole
+argument for building the screen this way rather than as a lighter separate path.
+
+Cross-checked once more on `footage/session01/vdo.avi`, against `b2_base9`:
+processed frames 667 and raw detections 3195 and tracker ids 127 are **the same
+as the documented baseline**, which they must be, because stitching never feeds
+back into the tracker. Stitches 60 → 63, rows 66 → 74 and the one plate read
+gone are the documented effect of `stitch_alias_revoke` and `stitch_footprint`
+being on now and off then — and the read it loses is the 50×24px `AP4H4111` that
+CLAUDE.md already records as a false read.
+
+## The refactor, announced and then proved neutral
+
+`run_worker` built its `TrackStitcher` from twenty `config.default(...)` calls
+inline. Analyze needs the same stitcher, and a second copy of twenty thresholds
+drifts — a drifted copy would mean the same clip analysed and ingested reporting
+different vehicle counts, which is precisely the comparison above. So the block
+moved to `app/stitch.py:from_config()` and both callers read it.
+
+`scratch/p4c/stitcher_parity.py` reconstructs the literal argument list
+`run_worker` passed before the change and compares the resulting object against
+`from_config()`'s: **all 17 settings identical, same values and same types.**
+That is a stronger statement than "the suites still pass", and both were checked.
+
+## Decisions, and what each one refuses
+
+**An analysis is never a sighting, and never becomes one.** A sighting is a
+vehicle a placed camera saw at an absolute time; an analysis is what the models
+say about a file. The file has no location and no start time, so the results
+carry an **offset into the media in seconds** and no absolute timestamp at all.
+Writing them into `sightings` would put rows with no source and no real clock
+into every trajectory and travel-time figure in the app. Verified two ways: no
+row was written during the whole verification run (0 before, 0 after), and
+structurally `app/analyze.py` contains no SQL and never imports `app.db`.
+
+The consequence, stated so it is not discovered later: **analysing is not a way
+to import.** A clip analysed and the same clip ingested produce the same
+vehicles, and only the source's are in the database.
+
+**One spawned child per job, one job at a time.** Same pattern as `probe.py` and
+for the same reason: the analysis loads three models and holds a capture, and
+neither belongs in the API process. Serialised because the card is 6 GB and has
+to hold three streams — a fourth model set loaded because two people pressed
+Analyze spends that budget twice. A queued job says where it is in the queue.
+Measured cost of the per-job model load: **an image analysis is 3.0–3.3s end to
+end**, and a 20.8s clip is 7.4s, so the child is not reloading anything per
+frame.
+
+**The boxes are drawn in the DOM, not burnt into the jpeg.** The child writes
+plain downscaled frames and box coordinates as fractions of the frame. A burnt-in
+box is fixed at whatever size the frame was written at and cannot be clicked,
+and this screen's promise is that every detection opens. It also keeps OpenCV's
+Hershey font out of a screen that sets its type properly.
+
+**Progress is polled, not pushed.** The websocket carries committed sightings and
+an analysis produces none; putting job progress on it would send one person's
+upload progress to every Live screen in the building.
+
+**Jobs are in-memory and their directories are swept at startup.** A job is a
+question somebody asked about a file, not a record of anything observed, and it
+has no place in the frozen schema. A restart therefore orphans every directory,
+so `AnalysisJobs.start()` sweeps them — verified directly: two planted stale
+directories, `[analyze] swept 2 job directories left by a previous run`, empty
+after.
+
+## The scrubbable timeline, and the one bound on it
+
+Every processed frame gets its own image, its own offset and its own boxes, so
+the scrubber shows what the pipeline actually saw rather than an interpolation
+of it. The plate drawn on a box is `live_read` — the best single read *by that
+frame*, never the final vote, because the vote runs when the track ends and
+showing it early would claim the pipeline knew something it did not yet know.
+
+That is bounded, because the pictures are not free. Past
+`analyze_max_frames: 600` the annotated frames are strided uniformly and the
+result reports the stride; **the detections are never strided, only the pictures
+of them**, and the screen says "timeline shows every Nth processed frame" when
+it is doing that. Exercised on `vdo.avi`, the only clip long enough to trigger it:
+
+    667 processed frames -> stride 2 -> 334 timeline frames
+    spanning 0.0 -> 199.8s of a 200.1s clip
+    frames 334 files 31.7 MB   crops 74 files 0.8 MB   total 32.7 MB
+
+## Regression
+
+Every earlier suite, shipped configuration, after the worker and api changes
+(`scratch/p4c/regression.py`, logs `scratch/p4c/reg_*.log`):
+
+    p1_verify              21/22   the documented environmental failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision   14/14
+    p2_verify               34/34
+    p3_verify               57/57
+    p4a_verify              25/25
+    p4b_verify              74/74
+
+**230 of 231 — the documented baseline exactly, same single failure.**
+`p1_verify`'s webcam check fails on "webcam produced sightings -- 0 sightings"
+and needs something the COCO model calls a vehicle in front of the lens; the
+reasoning is unchanged from 2026-09-02.
+
+## What this screen does not do
+
+- **No absolute times, and no map.** Deliberate — see above. A file has no
+  location, so there is nothing to place and nothing to trace across.
+- **Multiple images are uploaded one at a time.** The Sources screen's image
+  flow takes several; this one takes the file you dropped. One analysis at a
+  time is the constraint that makes a batch flow dishonest here — it would queue
+  and look stalled.
+- **The result is not persistent.** A restart loses every job and sweeps its
+  frames. Export before you restart; that is what the export is for.
+- **A one-frame read is a weak read**, and the screen shows the vote size beside
+  every plate so that it reads as one. Nothing here changes the OCR ceiling
+  CLAUDE.md already measures.
+
+## Current state
+
+`data/anpr.db` is exactly as this session found it — 6 sources, all `done`, 164
+sightings. Nothing this session ran wrote to it: the verification used a
+throwaway database, and `scratch/bench_realvideo.py` cleans up its own rows.
+`data/analyze` is empty, every job directory this session created having been
+deleted with its job. `footage/uploads` has no file this session added.
+
+`web/dist` is rebuilt: 477.6 kB js, 33.4 kB css.
+
+Ready for P4d.
