@@ -40,7 +40,15 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 
-from app import analyze as analysis, config, db, probe, sources as source_rules
+from app import (
+    analyze as analysis,
+    config,
+    db,
+    matching,
+    probe,
+    sources as source_rules,
+    trajectory as trace,
+)
 from app.stream import Hub
 
 # Long enough to stay quiet on an idle feed, short enough that a browser that
@@ -191,6 +199,26 @@ def create_app(pipeline=None):
         finally:
             conn.close()
         return [dict(row) for row in rows]
+
+    @app.get("/api/sightings/{sighting_id}")
+    def sighting(sighting_id: int):
+        """One sighting, whole.
+
+        The Trace screen shows the same evidence panel the Live feed does, and
+        that panel wants the fields a trajectory stop does not carry -- the
+        track id and the stored candidates. Rather than widen the trajectory
+        contract to feed a panel, the panel reads the row it is about.
+        """
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM sightings WHERE sighting_id = ?", (sighting_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return fail(404, f"There is no sighting {sighting_id}.")
+        return dict(row)
 
     @app.get("/api/alerts")
     def alerts(limit: int = Query(50, ge=1, le=500)):
@@ -752,6 +780,87 @@ def create_app(pipeline=None):
             media_type="application/json",
             headers=headers,
         )
+
+    # ------------------------------------------------------------- trace (P4d)
+
+    # Both routes are read-only views over the P3 modules -- nothing here
+    # decides anything the matcher does not already decide, and neither route
+    # writes. The screen's whole promise is that a search is fuzzy and shows
+    # its working, so both the score and how it matched travel with every row.
+
+    @app.get("/api/search")
+    def search(
+        q: str = Query("", description="plate to look for, however badly read"),
+        limit: int = Query(10, ge=1, le=50),
+        min_score: float = Query(0.72, ge=0.0, le=1.0),
+    ):
+        """Ranked candidate plates for one query.
+
+        A list, always, even when it holds one entry. Returning the single best
+        row as though it were the answer is the mistake this whole screen exists
+        to avoid: the match is fuzzy and the person searching has to be the one
+        who decides which candidate is their vehicle.
+        """
+        query = (q or "").strip()
+        if not query:
+            return fail(400, "Type a plate to search for. Partial reads are fine.")
+
+        conn = db.connect()
+        try:
+            results = matching.search(conn, query, limit=limit, min_score=min_score)
+            # A miss is not always a miss. Similarity is normalised by the
+            # longer string, so half a registration scores about 50% however
+            # right it is -- typing MH15HY of MH15HY2237 lands at 0.67, under
+            # the floor, and the screen would otherwise say "nothing matches"
+            # about a vehicle sitting in the database. The best refused
+            # candidate travels with the empty answer so the screen can name it
+            # and offer to reach it, rather than the floor being a silent wall.
+            closest = None
+            if not results:
+                near = matching.search(conn, query, limit=1, min_score=0.0)
+                if near:
+                    closest = {
+                        "plate_text": near[0]["plate_text"],
+                        "score": near[0]["score"],
+                        "sighting_count": near[0]["sighting_count"],
+                    }
+            plated = conn.execute(
+                "SELECT COUNT(*) FROM sightings WHERE plate_text IS NOT NULL"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        return {
+            "query": query,
+            "normalized": matching.normalize(query),
+            "min_score": min_score,
+            # What the search had to work with. An empty result over 0 plated
+            # sightings is a different situation from an empty result over 400,
+            # and the screen has to say which one it is.
+            "searched": plated,
+            "closest": closest,
+            "results": results,
+        }
+
+    @app.get("/api/trajectory")
+    def path_for_plate(
+        plate: str = Query(""),
+        min_score: float = Query(0.72, ge=0.0, le=1.0),
+        limit: int = Query(500, ge=1, le=2000),
+    ):
+        """One vehicle's stops, in time order, with the leg to each.
+
+        Gathered by the same fuzzy match, not by equality: the sightings that
+        make up one journey are exactly the ones whose plate strings disagree.
+        """
+        wanted = (plate or "").strip()
+        if not wanted:
+            return fail(400, "Choose a plate to trace.")
+
+        conn = db.connect()
+        try:
+            return trace.trajectory(conn, wanted, min_score=min_score, limit=limit)
+        finally:
+            conn.close()
 
     # ---------------------------------------------------------------- statics
 

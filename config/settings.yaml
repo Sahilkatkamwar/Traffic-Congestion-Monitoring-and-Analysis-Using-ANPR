@@ -8,9 +8,24 @@
 # ocr is a .pt rather than the usual .onnx. fast-plate-ocr's trainer needs keras
 # and torch.onnx.export needs onnx; neither is installed and CLAUDE.md forbids
 # pip, so the fine-tune is PyTorch and app/ocr.py wraps it in the same
-# interface. Its alphabet and slot count live in ocr_best_plate_config.yaml
-# beside it. Measured on data/ocr/test: 62.5% exact vs the pretrained model's
-# 36.8% (scripts/eval_ocr.py).
+# interface. Its alphabet and slot count live in the *_plate_config.yaml beside
+# the weights, so the model file is the only thing this line has to name.
+#
+# CHANGED 2026-09-04: ocr_best.pt -> ocr_tworow500.pt, the first OCR promotion
+# this project has made. Five earlier two-row candidates were all rejected for
+# moving nothing; this one is warm-started from ocr_best.pt and trained on 339
+# hand-transcribed real two-row crops (data/ocr/two_row_split.csv). The
+# outgoing model is kept byte-identical at models/finetuned/ocr_best.pt and
+# copied to ocr_best_rollback.pt; rolling back is this one line.
+#
+#   held-out two-row, 185 crops over test+val+heldout   3.2% -> 30.8% exact
+#   held-out single-row, 464 crops over test+val       69.2% -> 69.6% exact
+#   eight-clip real video, exact against hand labels    1/4 -> 2/4
+#   eight-clip real video, mean similarity             0.750 -> 0.816
+#   MH17CY4718, the two-row plate, first exact read ever on this footage
+#   rows / reads / detections / stitches / 23sec.mp4 false reads: unchanged
+#
+# See CLAUDE.md, "OCR fine-tune 3" and TRAINING.md, "Fine-tune 2d".
 #
 # plate_detector is trained on data/plate_det's 181 scene images only. The other
 # 905 annotated images are already-cropped plates, and training on them taught
@@ -36,7 +51,7 @@ models:
   vehicle_detector: models/yolo11n.pt
   plate_detector:   models/finetuned/plate_det_scenes.pt
   vehicle_classes:  null
-  ocr:              models/finetuned/ocr_best.pt
+  ocr:              models/finetuned/ocr_tworow500.pt
   # Appearance descriptor for re-identifying one physical vehicle across
   # tracker fragmentation. null uses models/yolo11n-cls.pt, which is already on
   # disk as the classifier's starting weights -- these are ImageNet features,

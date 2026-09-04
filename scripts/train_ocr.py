@@ -307,11 +307,14 @@ def build_items(image_dir, labels_path, skipped):
 
 
 def read_split_csv(path):
-    """data/ocr_two_row_real/split.csv -> [dict], the plate-disjoint assignment.
+    """data/ocr/two_row_split.csv -> [dict], the plate-disjoint assignment.
 
-    Written by scratch/tworow2/prep_two_row_real.py. The plate string in here
-    is the corrected one, not necessarily the supplied one; which lines were
-    corrected and why is in scratch/tworow2/corrections.csv.
+    Written by scripts/prep_two_row_real.py. The plate string in here is the
+    HAND TRANSCRIPTION, not the label supplied beside the image: scored against
+    that transcription the supplied labels are 26.9% correct overall and 11.3%
+    correct on the photographed crops, because they are another recogniser's
+    output rather than a reading. The supplied string travels in the same row
+    as `supplied_label` so the disagreement stays visible.
     """
     import csv
 
@@ -321,20 +324,26 @@ def read_split_csv(path):
         return list(csv.DictReader(handle))
 
 
-def build_two_row_items(image_dir, split_csv, want_split, origins, skipped):
-    """The supplied real two-row crops on one side of the split.
+def build_two_row_items(image_dir, split_csv, want_split, origins, skipped,
+                        sources=None):
+    """The real two-row crops on one side of the plate-disjoint split.
 
-    `origins` filters by where the plate comes from -- `indian`, `azerbaijan`,
-    `nonstandard`. Twenty-seven of the seventy-seven supplied crops are
-    Azerbaijani, which are two-row plates but not the grammar this model's slot
-    heads are learning, so whether they help is a question to measure rather
-    than assume.
+    `origins` filters by which grammar the plate follows -- `indian`,
+    `azerbaijan`, `nonstandard` -- because an Azerbaijani plate is a two-row
+    plate but not the shape this model's slot heads are learning, and whether
+    it helps is a question to measure rather than assume.
+
+    `sources` filters by `photo` or `rendered`. 121 of the 484 crops are flat
+    vector renders rather than photographs; they carry the two-row layout but
+    none of the camera, so they are separable on purpose.
     """
     items = []
     for row in read_split_csv(split_csv):
         if row["split"] != want_split:
             continue
         if origins and row["origin"] not in origins:
+            continue
+        if sources and row.get("source") not in sources:
             continue
         path = image_dir / row["file"]
         if not path.exists():
@@ -524,6 +533,9 @@ def main(argv=None):
                              "repeated per epoch. 0 leaves them out entirely")
     parser.add_argument("--two-row-origins", default="indian,azerbaijan,nonstandard",
                         help="which of the supplied crops to use, by plate origin")
+    parser.add_argument("--two-row-sources", default="photo,rendered",
+                        help="photo and/or rendered; 121 of the 484 crops are "
+                             "flat vector renders rather than photographs")
     parser.add_argument("--existing-two-row-repeat", type=int, default=0,
                         help="extra repeats of the two-row crops ALREADY in "
                              "data/ocr/train, on top of --real-repeat")
@@ -583,18 +595,23 @@ def main(argv=None):
     # weighted sampler, for one reason: with 46 crops against 49432 the sampler
     # would have to be told a weight anyway, and a repeat count is the same
     # thing said in a number that appears in the run log.
-    two_row_dir = ROOT / "data" / "ocr_two_row_real"
+    two_row_dir = OCR_DIR / "two_row_plate_images"
+    two_row_csv = OCR_DIR / "two_row_split.csv"
     origins = {o.strip() for o in args.two_row_origins.split(",") if o.strip()}
+    sources = {s.strip() for s in args.two_row_sources.split(",") if s.strip()}
     two_row_new = build_two_row_items(
-        two_row_dir, two_row_dir / "split.csv", "train", origins, skipped
+        two_row_dir, two_row_csv, "train", origins, skipped, sources
     )
+    # The heldout side is never filtered: it is the benchmark, and narrowing it
+    # to whatever a run happened to train on would make each run's number mean
+    # something different.
     two_row_held = build_two_row_items(
-        two_row_dir, two_row_dir / "split.csv", "heldout", None, skipped
+        two_row_dir, two_row_csv, "heldout", None, skipped
     )
     if args.two_row_repeat and not two_row_new:
         raise SystemExit(
-            "--two-row-repeat was given but data/ocr_two_row_real/split.csv "
-            "yielded no train crops. Run scratch/tworow2/prep_two_row_real.py."
+            "--two-row-repeat was given but data/ocr/two_row_split.csv "
+            "yielded no train crops. Run scripts/prep_two_row_real.py."
         )
     if args.two_row_repeat:
         train_items = train_items + two_row_new * args.two_row_repeat

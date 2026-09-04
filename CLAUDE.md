@@ -349,6 +349,8 @@ them is the single easiest way to waste a training run here.
 | `data/vehicle_plate_frames/` | **plate detection** | 14 sources, 1007 frames, 1705 plate boxes | pseudo-labels, single class, recall-incomplete |
 | `data/plate_frames_split/` | plate detection, derived | source-disjoint train/val/test built from the above | built by `scripts/prep_plate_frames.py` |
 | `data/plate_frames_split_c/` | as above, plus ensemble-completed train boxes | same split, 163 extra train boxes | same script, `--complete` |
+| `data/ocr/two_row_plate_images/` | **two-row plate OCR** | 502 crops of two-row plates, 363 photographed and 121 rendered | supplied labels are **26.9% correct** and unused; the labels actually used are the hand transcription in `scratch/tworow4/transcriptions.tsv` |
+| `data/ocr/two_row_split.csv` | two-row OCR, derived | 484 usable crops over 460 registrations, plate-disjoint train/heldout | built by `scripts/prep_two_row_real.py` |
 
 `data/vehicle_cls` holds no bounding boxes and **cannot** be used for detection.
 `data/vehicle_det` holds boxes but no `auto` class — autorickshaws in it are
@@ -909,7 +911,8 @@ changed it:
 
    The reason given here used to be "the model has only ever seen single-row
    plates", and that is **not true of the model actually in use**. `models.ocr`
-   is `models/finetuned/ocr_best.pt`, and `scripts/gen_synthetic_plates.py`
+   was `models/finetuned/ocr_best.pt` when this was written — it is
+   `ocr_tworow500.pt` since 2026-09-04 — and `scripts/gen_synthetic_plates.py`
    renders 18% of its 40000 synthetic crops as stacked two rows (~7080 images,
    measured 17.7%), plus the 23 real two-row crops in the training split. The
    fine-tune has seen the stacked form ~7100 times. It reads it badly anyway —
@@ -942,6 +945,12 @@ confidence to `TS22Z2215` at 0.18, because narrower crops displace better views
 inside the vote.
 
 ### Why exact OCR is still 1 of 4
+
+> **Superseded 2026-09-04: it is 2 of 4.** The diagnosis below was right and is
+> why — the remaining error was the OCR model's character discrimination, and
+> `MH17CY4718` is now read exactly by the model trained on 339 real two-row
+> crops. See "OCR fine-tune 3". `MP09ZS0907` is still never detected, which
+> this section already identifies as a plate-detector failure.
 
 `scratch/inf/ocr_ceiling.py` separates the three possible causes. **It is not
 resolution and it is not sampling.** Every labelled plate is above the ~8px per
@@ -1427,6 +1436,244 @@ similarity 0.352 → 0.500 on this set with no model change**, and that is a
 change to `app/ocr.py` that this pass deliberately did not make: it must be
 measured on `scratch/bench_realvideo.py` first, where pipeline plate crops are
 already tighter than these curated ones and the gain may not survive.
+
+## OCR fine-tune 3 — 500 real two-row crops, ADOPTED 2026-09-04
+
+> **This supersedes the decision, not the reasoning, of every OCR section above
+> it.** `models.ocr` is now `models/finetuned/ocr_tworow500.pt`. Everything
+> those sections measured still stands and none of it was re-run to make this
+> work — the layout regeneration, the architecture row-swap probe and the
+> inference-side rearrangement all remain closed, and this section closes the
+> one lead all three of them named as what was actually missing.
+
+TRAINING.md's own conclusion after the 77-crop pass was: *"Any next attempt
+needs real two-row crops in the hundreds, and Indian ones."* This is that.
+
+### The dataset, and the finding that decided how it could be used
+
+Supplied as `data/ocr/two_row_plate_images` (502 images) beside
+`data/ocr/two_row_plate_labels` (502 `.txt` files, one plate string each).
+Audited by `scratch/tworow4/audit.py`:
+
+    image files 502   label files 502   paired 500   (2 label files are empty)
+    byte-identical duplicate images 0
+    distinct supplied plate strings 493 over 500 crops
+    width  min 72  median 520  max 1600     below min_plate_width 48: 0
+    16 supplied strings are longer than the model's 11 slots
+
+**The images are excellent and the labels are not.** All 500 were transcribed
+by eye off the pixels, in 21 numbered contact sheets, without the supplied
+labels in view (`scratch/tworow4/transcribe_sheets.py`, transcription in
+`scratch/tworow4/transcriptions.tsv`). Scored against that reading
+(`scratch/tworow4/compare.py`):
+
+| | crops | supplied label exact |
+|---|---|---|
+| **photographed** | 363 | **41 = 11.3%** |
+| rendered (flat vector plates) | 121 | 89 = 73.6% |
+| **all usable** | **484** | **130 = 26.9%** |
+
+The error pattern names the cause: `MH` → `MHT`, `1` → `T`, `0` → `O`,
+truncated tails, and whole strings replaced by fragments — `MH17D P1417`
+labelled `FMX`, `MH03A Q4270` labelled `8423`, `MH65E R4547` labelled `FHEH`,
+`PB10G N4497` labelled `PBTOLR4L92PBTOGNLL9Z`. **These are another
+recogniser's output, not a transcription.** Training on them as supplied would
+have taught this model an OCR model's mistakes, and the 73.6% on the rendered
+crops — the easy ones — is what a machine labeller looks like when the picture
+is clean.
+
+`data/ocr/two_row_plate_labels` is never modified. The transcription is a
+separate file and the supplied string travels beside it in
+`two_row_split.csv`'s `supplied_label` column, so the disagreement stays
+auditable rather than being quietly resolved.
+
+**16 crops are excluded** and each carries its reason: 4 cut mid-string by the
+crop, 2 with an `IND` sticker over a character of the district code, 4 with
+Devanagari numerals, 2 illegible through rust or lost paint, 1 novelty panel,
+1 plate carrying two registrations, 1 with a digit outside the frame, 1
+unpainted embossing. **484 crops over 460 registrations survive.**
+
+**121 of the 484 are flat vector renders rather than photographs.** They carry
+the two-row layout and none of the camera, and they are tagged `source` in the
+split so they can be separated; they are not called real footage anywhere.
+
+### The split — plate-disjoint, and checked rather than asserted
+
+`scripts/prep_two_row_real.py` writes `data/ocr/two_row_split.csv`. A
+registration photographed five times is one label seen five times, so the
+assignment is made per plate string and applied to every crop of it. A plate
+already in `data/ocr/val` or `test` can never reach train; one already in
+`data/ocr/train` goes to train; everything else is assigned by a hash of its
+own string, so the split is identical on every run.
+
+| | crops | plates | indian | azeri | other | photo | rendered |
+|---|---|---|---|---|---|---|---|
+| train | 339 | 321 | 319 | 18 | 2 | 248 | 91 |
+| **heldout** | **145** | **139** | **134** | 9 | 2 | **115** | 30 |
+
+Verified, not assumed: **0 plates appear on both sides**, 0 new-train plates
+appear in `data/ocr/val` or `test`, and `data/ocr/train`, `val` and `test` are
+left byte-identical so every number measured before this dataset existed stays
+comparable. The heldout 145 is **7.4x** the 19 two-row crops in `data/ocr/test`
+that this file already called too small to resolve one plate.
+
+### Training — warm start, controlled mixture
+
+    python scripts/train_ocr.py --init models/finetuned/ocr_best.pt \
+        --out models/finetuned/ocr_tworow500.pt \
+        --two-row-repeat 12 --existing-two-row-repeat 8 \
+        --epochs 30 --lr 1e-3 --select val
+
+Warm-started from the production weights, so this is a fine-tune of the shipped
+model rather than a new one. Architecture, input geometry, preprocessing,
+alphabet and slot count are untouched — nothing in `app/ocr.py` knows the model
+changed. The epoch is **53676 samples: 40000 synthetic + 1179 real x8 + 339 real
+two-row x12 + 22 existing two-row x8**, so the new data is 7.6% of the epoch and
+about 30% of the real portion. Selection is on real val plate accuracy, exactly
+as `ocr_best.pt` was selected; **the heldout set is never selected on.** Best
+epoch 14 of 30.
+
+### Result — every held-out set, one scorer
+
+`scratch/tworow4/score.py`, both models over identical crops. The `ocr_best`
+column reproduces CLAUDE.md's existing numbers exactly (test 62.7%, single-row
+67.4%, test two-row 5.3%, val two-row 19.0%), which is what puts this table on
+the same axis as every OCR number above it.
+
+| | `ocr_best` | `ocr_tworow500` |
+|---|---|---|
+| test exact, n=252 | 62.7% | 62.3% |
+| **test single-row exact, n=233** | **67.4%** | **66.1%** |
+| test two-row exact, n=19 | 5.3% | **15.8%** |
+| val exact, n=252 | 66.7% | **71.0%** |
+| **val single-row exact, n=231** | **71.0%** | **73.2%** |
+| val two-row exact, n=21 | 19.0% | **47.6%** |
+| **heldout two-row exact, n=145** | **0.7%** (1) | **30.3% (44)** |
+| heldout photographed, n=115 | 0.9% | **26.1%** |
+| heldout photographed Indian, n=104 | 1.0% | **28.8%** |
+| heldout two-row characters | 36.9% | **75.2%** |
+| **pooled held-out single-row, n=464** | **69.2%** | **69.6%** |
+| **pooled held-out two-row, n=185** | **3.2%** (6) | **30.8% (57)** |
+
+**The pooled two-row count is the number that decides it**, because it is the
+number every previous candidate failed to move: over all 185 held-out two-row
+crops it goes **6 → 57**, where the entire spread across the nine models of the
+previous pass was three plates.
+
+### The single-row dip is churn, not forgetting — measured
+
+Test single-row falls 3 plates, and that is the one result that could have
+blocked this. Counting which crops moved rather than the net
+(`scratch/tworow4/score.json`):
+
+| | lost | gained | net |
+|---|---|---|---|
+| test single-row, n=233 | 12 | 9 | **−3** |
+| val single-row, n=231 | 5 | 10 | **+5** |
+| **pooled single-row, n=464** | **17** | **19** | **+2** |
+
+Every one of the 21 moves is a **single-character confusion swapping which way
+it goes** — `DL12C3536` becoming `ML12C3536` on one side, `AS23K5585` becoming
+the correct `AS23X5585` on the other; also M/H, M/N, 8/0, X/V, K/B, 3/5. The
+model did not forget single-row plates; it redistributed which confusions it
+makes, and on the pooled held-out single-row set it comes out **two plates
+ahead**. A directional loss would have been losses with no gains, and that is
+not what is there.
+
+### Real video — the two-row plate is read, for the first time
+
+`scratch/tworow4/bench_ocr.py`, the same eight clips as `f_prodA` and
+`f_final`, only `models.ocr` swapped and restored afterwards. The `t4_base`
+column is `models/finetuned/ocr_best.pt` through the current code and it
+reproduces `f_final` exactly.
+
+| | `t4_base` | `t4_c1` (adopted) |
+|---|---|---|
+| sightings written | 412 | **412** |
+| plate crops / reads / distinct | 14 / 14 / 14 | **14 / 14 / 14** |
+| raw detections, tracker ids, stitches | identical | identical |
+| **false reads on the plate-less `23sec.mp4`** | **0** | **0** |
+| exact OCR vs hand labels | 1/4 = 25.0% | **2/4 = 50.0%** |
+| character accuracy | 30/40 = 75.0% | **32/40 = 80.0%** |
+| **mean similarity to hand labels** | **0.750** | **0.816** |
+| mean frames voted per read | 2.21 | **2.57** |
+
+Per hand-labelled plate:
+
+| label | `t4_base` | `t4_c1` |
+|---|---|---|
+| MH15JS4241 | `MH15JS4241` 1.00 | `MH15JS4241` 1.00 |
+| MH15HY2237 | `MH15HY2277` 0.90 | `MH15HY2277` 0.90 |
+| **MH17CY4718 — the two-row one** | `MH17CI1478` 0.70 | **`MH17CY4718` 1.00** |
+| MP09ZS0907 — never detected | `ML06B0877` 0.40 | `MH07GZ5498` 0.36 |
+
+**`MH17CY4718` is read exactly.** Every OCR pass in this file failed on that
+plate — 0.47, then 0.70, then 0.70 or 0.80 across nine candidates — and it is
+the only genuine two-row plate in the hand-labelled set. `MP09ZS0907` moving
+0.40 → 0.36 is noise on a plate that is **never detected**: both strings are a
+different vehicle's row scoring nearest it, which is a plate-detector failure
+and not an OCR one.
+
+Rows, detections, tracker ids and stitches are identical clip for clip, so
+nothing outside OCR moved, and the zero-false-read property on the plate-less
+control survives.
+
+### Regression — 229 of 231, and the second failure is calibration
+
+Re-run with the promoted model: p1 21/22, p1_shutdown 5/5, p1_supervision
+14/14, p2 **33/34**, p3 57/57, p4a 25/25, p4b 74/74.
+
+`p1_verify`'s webcam check is the documented environmental failure and is
+unchanged. **`p2_verify` is a new failure and it is not an accuracy
+regression.** That script inspects the single highest-confidence plated row in
+`footage/clips/20 sec.mp4` and asserts its first six characters. On that clip:
+
+    ocr_best        MH15HY2277 conf 0.60 voted 3   |  PB61V6819 conf 0.31 voted 1
+    ocr_tworow500   MH15HY2277 conf 0.56 voted 5   |  MH15BY2231 conf 0.72 voted 1
+
+The genuine plate is read **identically and with more votes** (5 against 3).
+What changed is the second row — a truck with no legible plate, which both
+models invent a string for. Its confidence rose 0.31 → **0.72**, so it becomes
+the highest-confidence row and `p2_verify` inspects it instead of the car.
+
+That is a real downside and it is stated as one: **the promoted model is more
+confident on an unreadable crop.** It does not create a read that was not
+already there — reads stay 14 of 14 across the eight clips and the plate-less
+control stays 0 — but confidence is shown in the UI and is what `plate_conf`
+ranking uses, so an inflated score on a junk crop is a genuine cost. The check
+was left failing rather than adjusted; editing a verification script to admit a
+candidate is how a regression gets shipped.
+
+### Decision
+
+**ADOPTED. `models.ocr` is `models/finetuned/ocr_tworow500.pt`.** The gate was a
+material improvement in real two-row OCR with no meaningful regression on
+one-row, and both halves are met: pooled held-out two-row exact 3.2% → 30.8%,
+pooled held-out single-row 69.2% → **69.6%**, real-video similarity 0.750 →
+0.816 with the two-row plate read exactly for the first time, and the
+zero-false-read property intact. `models/finetuned/ocr_best.pt` is untouched on
+disk and copied to `ocr_best_rollback.pt`; rolling back is one line in
+`config/settings.yaml`.
+
+### What is still wrong with two-row OCR
+
+- **69.7% of the held-out two-row crops are still read wrong** — 101 of 145.
+  This is a large improvement on 144 of 145, and it is not a solved problem.
+- **Azerbaijani plates are 0/9 exact on the heldout set**, as they were in
+  every earlier pass. The slot heads are learning
+  `[2 letters][1-2 digits][1-3 letters][4 digits]`; a `10-EX-500` layout is not
+  that shape and no amount of this data changes it.
+- **The confidence calibration got worse on unreadable crops**, measured above
+  at 0.31 → 0.72 on one truck. Nothing here was tuned against that and it is
+  the one axis on which the promoted model is behind.
+- **The rendered quarter of the dataset is not footage.** 91 of the 339
+  training crops are flat vector plates. They were not ablated out — the
+  photograph-only run was not made — so how much of the gain they carry is
+  unmeasured. `--two-row-sources photo` exists for that experiment.
+- **The transcription is one reader's, unreplicated.** 484 crops read once by
+  eye. The supplied labels agree with it on 11.3% of the photographs, which
+  says the supplied labels are wrong rather than that this reading is right;
+  a second independent pass over the same crops has not been made.
 
 ## Vehicle type classifier — retested 2026-09-02, still not adopted
 

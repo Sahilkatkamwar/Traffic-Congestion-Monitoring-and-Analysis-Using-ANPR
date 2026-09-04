@@ -13,9 +13,9 @@ import { markerIcon, markerPopup } from './CameraMarker'
 // stamps every tile with "API KEY REQUIRED", which is someone else's watermark
 // across our evidence. This one is keyless and unbranded. Note the {z}/{y}/{x}
 // order -- Esri puts row before column, the reverse of the usual slippy URL.
-const TILES =
+export const TILES =
   'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}'
-const ATTRIBUTION =
+export const ATTRIBUTION =
   'Tiles &copy; <a href="https://www.esri.com/">Esri</a>, &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 
 // Centre of India, wide zoom. Only used until a source has coordinates -- the

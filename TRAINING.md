@@ -45,7 +45,8 @@ from `scripts/`.** The two tracks share files on disk, never code.
 | `models/finetuned/plate_det_scenes.pt` | you | **yes** | **in use** |
 | `models/finetuned/plate_det_best.pt` | you | yes | rejected, kept for the record |
 | `models/finetuned/vehicle_cls_best.pt` | you | **yes** | trained, **not adopted** |
-| `models/finetuned/ocr_best.pt` | you | **yes** | **in use** |
+| `models/finetuned/ocr_tworow500.pt` | you | **yes** | **in use** since 2026-09-04 |
+| `models/finetuned/ocr_best.pt` | you | **yes** | superseded 2026-09-04; **the rollback**, also copied to `ocr_best_rollback.pt` |
 | `models/finetuned/ocr_layouts.pt` | you | **yes** | trained, **not adopted** |
 | `models/finetuned/vehicle_det_road_frozen.pt` | you | **yes** | trained, **not adopted** |
 | `models/finetuned/vehicle_det_road_full.pt` | you | **yes** | rejected, catastrophic forgetting |
@@ -768,6 +769,148 @@ The second is a lead for `data/ocr` itself: if a tighter crop reads that much
 better at inference, the two-row crops in train may be carrying background that
 a tighter harvest would remove. Not acted on here.
 
+## Fine-tune 2d — 500 real two-row crops, trained 2026-09-04, **ADOPTED**
+
+The first OCR promotion this project has made, and the first time any of the
+two-row work has moved a number that mattered. Full result in CLAUDE.md, "OCR
+fine-tune 3"; what belongs to the training track is here.
+
+This is the experiment "Fine-tune 2c" named as the only one left: *"Any next
+attempt needs real two-row crops in the hundreds, and Indian ones."* The
+supplied drop is 502 crops, of which **484 are usable over 460 registrations,
+319 of the 339 training crops Indian** — against the 41 registrations that pass
+had.
+
+### The labels could not be used, and that is the first result
+
+`data/ocr/two_row_plate_labels` supplies one plate string per image. All 500
+paired crops were transcribed by eye from `scratch/tworow4/transcribe_sheets.py`'s
+numbered contact sheets, **without the supplied labels in view**, and the two
+compared afterwards (`scratch/tworow4/compare.py`):
+
+| | crops | supplied label exact |
+|---|---|---|
+| **photographed** | 363 | **41 = 11.3%** |
+| rendered | 121 | 89 = 73.6% |
+| **all usable** | **484** | **130 = 26.9%** |
+
+`MH17D P1417` is labelled `FMX`; `MH65E R4547` is labelled `FHEH`; `MH03A
+Q4270` is labelled `8423`; `PB10G N4497` is labelled `PBTOLR4L92PBTOGNLL9Z`.
+With `MH`→`MHT`, `1`→`T` and `0`→`O` throughout and 73.6% on the *rendered*
+crops, these are a recogniser's output rather than a transcription. **Training
+on them would have taught this model another OCR model's confusions**, which is
+the specific failure this project cannot afford, and it is why the transcription
+exists.
+
+`data/ocr/two_row_plate_labels` is never modified. The transcription is
+`scratch/tworow4/transcriptions.tsv` and the supplied string is carried into
+`data/ocr/two_row_split.csv` as `supplied_label`, so the disagreement stays in
+the dataset rather than being resolved out of sight.
+
+**16 crops are excluded**, each with its reason in the same file: cut
+mid-string, an `IND` sticker over a character, Devanagari numerals, rust,
+a novelty panel, two registrations on one plate.
+
+**121 of the 484 are flat vector renders, not photographs**, tagged `source` so
+they can be separated. `--two-row-sources photo` restricts training to the 248
+photographed train crops; that ablation was **not** run, so how much of the gain
+the renders carry is unmeasured.
+
+### Splitting — by plate string, and verified
+
+`scripts/prep_two_row_real.py` → `data/ocr/two_row_split.csv`. Same rule as
+Fine-tune 2c: a plate already in `data/ocr/val` or `test` can never reach train,
+one already in `data/ocr/train` goes to train, the rest are assigned by a hash
+of the plate string so every crop of a registration lands together.
+
+| | crops | plates | indian | azeri | other | photo | rendered |
+|---|---|---|---|---|---|---|---|
+| train | 339 | 321 | 319 | 18 | 2 | 248 | 91 |
+| heldout | 145 | 139 | 134 | 9 | 2 | 115 | 30 |
+
+Checked rather than asserted: **0 plates on both sides**, 0 new-train plates in
+`data/ocr/val` or `test`, and `data/ocr/train`, `val`, `test` byte-identical.
+
+### Training
+
+    python scripts/train_ocr.py --init models/finetuned/ocr_best.pt \
+        --out models/finetuned/ocr_tworow500.pt \
+        --two-row-repeat 12 --existing-two-row-repeat 8 \
+        --epochs 30 --lr 1e-3 --select val
+
+A warm-started fine-tune of the shipped weights, not a new model. Architecture,
+128x64 input, preprocessing, alphabet and 11 slots all unchanged, so it is a
+drop-in and `app/ocr.py` is untouched. Epoch = **53676 samples: 40000 synthetic
++ 1179 real x8 + 339 real two-row x12 + 22 existing two-row x8**, so the new
+data is 7.6% of the epoch and ~30% of the real portion — a controlled mixture,
+not a two-row-only fine-tune. Selection is real val plate accuracy, as
+`ocr_best.pt` was selected; the heldout 145 are never selected on. Best epoch
+14, run log `runs/ocr_20260904_030134`.
+
+`scripts/train_ocr.py` gained one flag, `--two-row-sources`, and its two-row
+paths were repointed from the deleted `data/ocr_two_row_real/` to
+`data/ocr/two_row_split.csv`. Every flag still defaults to off, so
+`python scripts/train_ocr.py` with no arguments still builds the `ocr_best.pt`
+run.
+
+### Result
+
+`scratch/tworow4/score.py`, both models over identical crops; the `ocr_best`
+column reproduces this file's existing numbers exactly.
+
+| | `ocr_best` | `ocr_tworow500` |
+|---|---|---|
+| test exact, n=252 | 62.7% | 62.3% |
+| test single-row exact, n=233 | 67.4% | 66.1% |
+| test two-row exact, n=19 | 5.3% | **15.8%** |
+| val single-row exact, n=231 | 71.0% | **73.2%** |
+| val two-row exact, n=21 | 19.0% | **47.6%** |
+| **heldout two-row exact, n=145** | **0.7%** | **30.3%** |
+| heldout two-row characters | 36.9% | **75.2%** |
+| **pooled held-out single-row, n=464** | 69.2% | **69.6%** |
+| **pooled held-out two-row, n=185** | **3.2%** | **30.8%** |
+
+Test single-row falls 3 plates and that is **churn, not forgetting**: it loses
+12 and gains 9, val single-row loses 5 and gains 10, and every one of the 21
+moves is a single-character confusion changing direction (`DL12C3536` →
+`ML12C3536` one way, `AS23K5585` → the correct `AS23X5585` the other). Pooled
+over both held-out single-row sets the candidate is **two plates ahead**.
+
+Real video, eight clips, only `models.ocr` swapped
+(`scratch/tworow4/bench_ocr.py`): sightings 412 → 412, reads 14 → 14, false
+reads on the plate-less `23sec.mp4` 0 → 0, **exact 1/4 → 2/4**, mean similarity
+**0.750 → 0.816**, and `MH17CY4718` — the two-row plate every earlier candidate
+missed — read **exactly**.
+
+### The cost, stated
+
+Regression 229/231 rather than 230/231. The new failure is `p2_verify`, and it
+is **not** an accuracy regression: on that clip the genuine plate is read
+identically and with more votes (5 against 3), but a truck with no legible plate
+that both models invent a string for goes from confidence 0.31 to **0.72**, so
+it becomes the highest-confidence row that `p2_verify` inspects. **The promoted
+model is more confident on unreadable crops.** The check was left failing rather
+than adjusted.
+
+### Decision
+
+**Adopted. `models.ocr` is `models/finetuned/ocr_tworow500.pt`.**
+`ocr_best.pt` is untouched on disk and copied to `ocr_best_rollback.pt`;
+rolling back is one line in `config/settings.yaml`.
+
+### What is left
+
+- **101 of the 145 heldout two-row crops are still wrong.** Improved from 144,
+  not solved.
+- **Azerbaijani plates stay 0/9.** The slot heads learn the Indian shape; a
+  `10-EX-500` layout is not it, and three passes have now shown this data
+  cannot change that.
+- **Confidence calibration on junk crops got worse**, measured at 0.31 → 0.72.
+  Nothing in this pass was tuned against it.
+- **The photo-only ablation was not run**, so the renders' contribution is
+  unknown.
+- **The transcription is one reader's, unreplicated.**
+
 ## Exit criterion
 
 `scripts/eval_ocr.py` prints plate-level accuracy on `data/ocr/test/` for:
@@ -1027,6 +1170,7 @@ argparse-driven, and writes only into `data/`, `models/finetuned/`, or `runs/`.
 | `train_vehicle_cls.py` | fine-tune 1; `--audit` counts the data and trains nothing |
 | `train_ocr.py` | fine-tune 2 |
 | `train_plate_det.py` | fine-tune 3, on plate boxes |
+| `prep_two_row_real.py` | plate-disjoint split of `data/ocr/two_row_plate_images` into `data/ocr/two_row_split.csv`, using the hand transcription rather than the supplied labels |
 | `prep_vehicle_det.py` | dedup + temporal split of `data/vehicle_det`'s pseudo-labels |
 | `train_vehicle_det.py` | fine-tune 4, vehicle detector candidates |
 | `prep_plate_frames.py` | source-disjoint split of `data/vehicle_plate_frames`; `--audit` reports and writes nothing, `--complete` adds the ensemble-agreed boxes |
@@ -1069,6 +1213,18 @@ argparse-driven, and writes only into `data/`, `models/finetuned/`, or `runs/`.
 | `tworow_rearrange.py` | the five-arm experiment over the 77 crops; writes `results.csv`, `summary.json`, the example sheets |
 | `cut_ablation.py` | thirteen single-read variants separating cut placement, trim and number of attempts |
 | `cut_check.py` | draws the boundaries without running OCR, which is how the first two finders were caught landing on bodywork |
+
+`scratch/tworow4/` holds the 2026-09-04 pass that produced the adopted OCR
+model, and nothing in `app/` or `scripts/` imports from it:
+
+| script | does |
+|---|---|
+| `audit.py` | integrity audit of the 502 supplied crops: pairing, duplicates, label validity, plate counts, geometry, overlap with `data/ocr` |
+| `transcribe_sheets.py` | writes `index.csv` and 21 numbered contact sheets so all 500 crops can be read off the pixels |
+| `transcriptions.tsv` | the hand transcription actually trained on, with a `keep`/`exclude` decision and a reason for each of the 16 exclusions |
+| `compare.py` | scores the supplied labels against the transcription — 26.9% overall, 11.3% on the photographs |
+| `score.py` | every checkpoint on one axis: test/val single-row and two-row, plus the 145-crop heldout, in exact / character / similarity |
+| `bench_ocr.py` | eight-clip real-video benchmark with one checkpoint swapped in, `settings.yaml` restored on exit |
 
 ## Rules
 

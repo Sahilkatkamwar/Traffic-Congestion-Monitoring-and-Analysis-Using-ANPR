@@ -44,3 +44,20 @@ export function parseCandidates(raw) {
     return []
   }
 }
+
+// A leg's elapsed time. Seconds under a minute, because a vehicle passing two
+// cameras eight seconds apart is a different fact from one passing them in
+// "0m", and negative gaps are said as negative -- two sightings that overlap in
+// time mean a track split or two overlapping views, and rounding that away
+// hides it. See app/trajectory.py, which leaves the sign alone for the same
+// reason.
+export function durationText(seconds) {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return null
+  const sign = seconds < 0 ? '-' : ''
+  const total = Math.abs(seconds)
+  if (total < 60) return `${sign}${total < 10 ? total.toFixed(1) : Math.round(total)}s`
+  const minutes = Math.floor(total / 60)
+  if (minutes < 60) return `${sign}${minutes}m ${String(Math.round(total % 60)).padStart(2, '0')}s`
+  const hours = Math.floor(minutes / 60)
+  return `${sign}${hours}h ${String(minutes % 60).padStart(2, '0')}m`
+}

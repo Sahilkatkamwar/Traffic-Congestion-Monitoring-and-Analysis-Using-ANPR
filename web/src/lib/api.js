@@ -114,6 +114,24 @@ export const deleteAnalysis = (id) =>
 export const exportUrl = (id, format) =>
   `/api/analyze/${encodeURIComponent(id)}/export.${format}`
 
+// --- trace (P4d) -----------------------------------------------------------
+//
+// Both of these are fuzzy. searchPlates never returns one silent answer -- it
+// returns a ranked list with every score attached -- and getTrajectory gathers
+// the stops the same way, so a vehicle read differently at two cameras is still
+// one journey.
+
+export const searchPlates = (query, limit = 10, minScore = null) =>
+  get(
+    `/api/search?q=${encodeURIComponent(query)}&limit=${limit}` +
+      (minScore == null ? '' : `&min_score=${minScore}`),
+  )
+
+export const getTrajectory = (plate) =>
+  get(`/api/trajectory?plate=${encodeURIComponent(plate)}`)
+
+export const getSighting = (id) => get(`/api/sightings/${encodeURIComponent(id)}`)
+
 // crop_path is stored relative to the project root ('crops/evidence/...') and
 // FastAPI mounts that directory at /crops, so the stored value is the URL.
 export const cropUrl = (path) => (path ? `/${path}` : null)

@@ -1561,3 +1561,206 @@ deleted with its job. `footage/uploads` has no file this session added.
 `web/dist` is rebuilt: 477.6 kB js, 33.4 kB css.
 
 Ready for P4d.
+
+# P4d - Trace
+
+P4d complete. Server stopped, port released.
+
+## Exit criteria - verified
+
+> *searching a plate and pressing play animates its path with crops in sync*
+
+`scratch/p4d_verify.py`, **81 checks passed, 0 failed, 0 skipped, 2s**
+(`scratch/p4d/p4d_verify.log`). The app starts once with **no pipeline** against
+a throwaway database, and everything below is done over HTTP the way the browser
+does it. The fixture is constructed rather than sampled, because the leg
+arithmetic needs gaps and distances whose right answer is known in advance and
+no footage provides that: one vehicle, `MH15HY2237`, seen at three sources and
+**read wrongly at every one of them**.
+
+| check | result |
+|---|---|
+| no stored row holds the plate being searched for | stored as `MH15HY227`, `MH15HX2237`, `MN15HY2237` |
+| the search finds it anyway | 3 candidates |
+| every candidate carries a score | 0.97 / 0.90 / 0.90 |
+| ...a sighting count and its sources | `MH15HY227`: 2 sightings, 2 sources |
+| ...and how it matched | `plate`, `plate`, **`candidate`** |
+| a read only findable through the vote's alternatives is found | `MH15HX2237`, via candidate |
+| a different vehicle is never offered | `KA05MN7788` excluded |
+| a sighting with no plate is not in the path | excluded, not an error |
+| selecting a candidate returns a time-ordered path | west, east, nowhere, east |
+| the gap is measured leaving one camera to arriving at the next | 120.0 s |
+| the leg carries the distance | 1.3256 km |
+| implied speed is that distance over that gap | **39.77 km/h**, and 1.3256 / (120/3600) = 39.77 |
+| an unplaced source keeps its stop and loses its leg | lat null, distance null, speed null |
+| the crops serve at the path the row stores | 200 `image/jpeg` |
+| **pressing play** | the node section below |
+| a deep link `/trace/MH15HY2237` survives a reload | 200, byte-identical to `/` |
+
+### "In sync" is a claim about one number, and that is what was checked
+
+There is no browser automation in this environment, so the criterion was not
+verified by watching pixels. It did not need to be. The map draws the path up to
+`activeIndex`, the evidence strip highlights the card at `activeIndex`, and both
+get it from `indexAt()` over the same positions -- so the sync is not a
+coincidence to be observed, it is one function whose answer has to be right.
+
+`scratch/p4d/scrub_check.mjs` runs that function **in node, imported from the
+file the bundle imports** -- `web/src/lib/timeline.js`, which is why the
+arithmetic was extracted there rather than left inside the component. A Python
+reimplementation would have been checking a second copy of it.
+
+    positions            [0, 0.339, 0.833, 1] over a span of 360.0s
+    unequal gaps         widest 0.494, narrowest 0.167 -- a time scrubber,
+                         not a stepper through a list
+    playing 0 -> 1       1000 frames, 0 of them backwards, 4 of 4 stops reached
+    the crop under the head is the last sighting the clock has passed
+                         0 of 1000 frames disagreed
+    clicking a stop      lands on that stop, 4 of 4
+    a vehicle seen once  span 0, position 0, no division by zero
+
+The third of those is the exit criterion stated exactly: at every frame of
+playback the highlighted crop is the last sighting whose timestamp the head has
+passed, and the next sighting has not happened yet.
+
+### And on real rows this session did not write
+
+Section H opens the **application database read-only** and traces a vehicle out
+of it. `MH15JS4241` returns 7 sightings over 3 sources spanning 65945.6 s, every
+stop scoring 1.00, every crop present on disk. `MH15HY2237` returns a journey
+assembled from `MH15HY22` and `MH15HY227` -- two reads of one vehicle that no
+equality test connects, which is the P3 claim arriving on screen.
+
+## What was built
+
+| file | what |
+|---|---|
+| `app/api.py` | `/api/search`, `/api/trajectory`, `/api/sightings/{id}` |
+| `web/src/screens/TraceScreen.jsx` | was an 11-line placeholder; now the screen |
+| `web/src/components/TrajectoryPath.jsx` | new. The path, numbered stops, the drawn-so-far line |
+| `web/src/components/TimeScrubber.jsx` | new. Play, the track, a tick at every stop |
+| `web/src/components/EvidenceStrip.jsx` | new. The crops, scrolled to follow the head |
+| `web/src/lib/timeline.js` | new. The scrubber's arithmetic, so node can check it |
+| `web/src/lib/format.js` | `durationText` |
+| `web/src/lib/api.js` | the three calls |
+| `web/src/components/MapCanvas.jsx` | exports its tile constants; nothing else changed |
+
+Nothing in `app/` outside `api.py` was touched. `matching.py` and
+`trajectory.py` are P3's and are used exactly as they were written -- the two
+routes are read-only views over them and decide nothing the matcher does not
+already decide.
+
+## The one real defect, and it was in the copy
+
+The screen first said, under the search box, *"Partial and misread plates are
+fine"*, and its empty state said *"Try fewer characters -- a partial plate
+matches more."* **Both were false, and the verification is what caught it.**
+
+`matching.similarity` normalises by the longer string, so six characters of a
+ten-character plate cannot score above about 0.67 however right they are:
+`MH15HY` against `MH15HY227` scores **0.6667**, under the 0.72 floor. Typing
+half a registration returned "nothing matches" about a vehicle sitting in the
+database, and the copy was telling people to do the thing that makes that worse.
+
+The floor was not moved -- it is P3's and it is load-bearing. What changed is
+that a refused near-miss is no longer invisible: `/api/search` returns
+`closest`, the best candidate below the floor, **only when the result is empty**,
+and the screen names it and offers a button that searches down to it.
+
+    MH15HY  ->  0 results, floor 0.72
+                closest MH15HY227 at 67%, over 2 sightings
+                [Search down to 67%]  ->  min_score 0.66  ->  found
+
+The button floors the score rather than rounding it, and that is not a detail:
+0.6667 **rounded** to 0.67 is a floor above the candidate it was offering, and
+the button would have found nothing. The verification made exactly that mistake
+first, and is now written to match the screen.
+
+## Decisions, and what each one refuses
+
+**The URL is the query.** `/trace/MH15HY2237` is the search, so a deep link
+survives a reload through the SPA fallback and "Trace this vehicle" from the
+Live feed or from Analyze is a link and nothing more.
+
+**A candidate is opened automatically only when the answer is not a choice.**
+One result, or a result whose plate is exactly what was asked for -- which is
+how "Trace this vehicle" arrives, carrying a plate string that came out of the
+database in the first place. Anything else stays a list. Picking the top row and
+drawing its path would be the silent single answer this screen exists to avoid,
+and it would do it at the moment the evidence is weakest.
+
+**The scrubber runs over time, not over the list of stops.** Four stops are not
+four equal steps: a vehicle can pass two cameras eight seconds apart and then
+take four minutes to reach the third. Indexed by stop, those two draw as the
+same interval -- a picture of a journey that never happened. On the fixture the
+ticks land at 0, 0.339, 0.833 and 1.
+
+**An analysis was never a sighting (P4c); a trajectory is never a write.**
+Section F checks that three ways: the sighting, source and alert counts are
+identical before and after the whole run, and the trace routes contain no
+`INSERT`, `UPDATE` or `DELETE` at all.
+
+**The evidence panel reads the row rather than the trajectory widening to feed
+it.** The panel shows the track id and the alternative readings; a stop does not
+carry them. Putting them in the trajectory would make every trajectory pay for a
+panel that opens on one stop at a time, so `/api/sightings/{id}` returns the row
+instead. The `sightings` table is unchanged -- no field was added to it.
+
+**A stop at an unplaced source stays on the path.** The vehicle was seen there.
+It gets no marker, its legs have no distance and no speed, and the screen says
+so in words -- "not placed" in the table and a count in the header -- rather
+than inventing a position for it.
+
+**Implied speed is coloured, not judged.** Above 150 km/h the figure turns red
+with a sentence saying to check both reads. It raises nothing and writes
+nothing: impossible-transition alerts are P5's, built from these same numbers.
+
+## What this screen does not do
+
+- **It does not merge candidates.** Two reads of one vehicle stay two rows in
+  the list, each with its own score and count, because deciding they are the
+  same vehicle is the decision the person is being asked to make. Opening
+  either one gathers both, since the trajectory matches fuzzily too.
+- **It does not animate a marker along the road.** The path is drawn to the
+  stop the head has passed; between two cameras there is no evidence of where
+  the vehicle was, and interpolating one would draw a vehicle onto a road
+  nobody saw it on.
+- **A negative gap is shown as negative.** Two sightings that overlap in time
+  mean a track split, or two cameras whose views overlap, and `-2.9s` says so
+  where a clamped `0s` would hide it. The application database contains these.
+- **Two sources can share a name.** The same clip added twice does exactly
+  that, and the table then shows several rows reading `20260901_152733`. The
+  source_id is on the cell as a title; nothing else distinguishes them, because
+  nothing else in the data does.
+
+## Regression
+
+Every earlier suite, shipped configuration, after the `app/api.py` change
+(`scratch/p4d/regression.py`, logs `scratch/p4d/reg_*.log`). `p4c_verify` is in
+the list now as well -- Analyze was the last phase to land, and its suite is the
+one most likely to notice a change to `api.py`:
+
+    p1_verify              21/22   the documented environmental failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision  14/14
+    p2_verify              34/34
+    p3_verify              57/57
+    p4a_verify             25/25
+    p4b_verify             74/74
+    p4c_verify             75/75
+
+**305 of 306 -- the documented 230-of-231 baseline plus P4c's 75, with the same
+single failure.** `p1_verify`'s webcam check fails on "webcam produced sightings
+-- 0 sightings" and needs something the COCO model calls a vehicle in front of
+the lens; the reasoning is unchanged from 2026-09-02.
+
+## Current state
+
+`data/anpr.db` is exactly as this session found it -- 6 sources, all `done`, 164
+sightings, 0 alerts. Nothing this session ran wrote to it: the verification used
+a throwaway database, and the three evidence crops its fixture needed under
+`crops/evidence/p4dtmp/` were deleted with it.
+
+`web/dist` is rebuilt: 497.0 kB js, 36.5 kB css.
+
+Ready for P5.
