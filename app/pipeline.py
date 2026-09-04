@@ -22,6 +22,11 @@ committed, so the live feed shows what was stored rather than what was claimed.
 It is set by the API to the websocket hub's publish. Left None the pipeline
 behaves exactly as it did in P1.
 
+P5 adds the alert checks to the same commit path. They run on the writer
+thread, on the writer's connection, immediately after a sighting commits --
+which is what makes "within seconds of its sighting" true rather than hopeful.
+They are wrapped: a failing check drops its alert and never stops the writer.
+
 P4b splits the old single drain loop into feeder + writer. The reason is the
 one-writer rule: the UI now creates, edits, places and deletes sources, and
 those writes have to happen on the same connection as the workers' or there are
@@ -36,7 +41,7 @@ import queue as queue_mod
 import threading
 import time
 
-from app import db
+from app import alerts as alert_rules, db
 from app.worker import run_worker
 
 # Sentinel put on the inbox when the feeder has nothing left to hand over and
@@ -127,6 +132,10 @@ class Pipeline:
         # Set by the API to Hub.publish. Called from the writer thread only,
         # after the commit, and never allowed to raise into the writer.
         self.on_event = None
+        # The watched plates. One instance, owned by the writer thread, because
+        # it caches the parsed file and re-reads it when the file changes --
+        # sharing it across threads would mean sharing that cache.
+        self.blacklist = alert_rules.Blacklist()
 
     # ---------------------------------------------------------------- start up
 
@@ -471,15 +480,44 @@ class Pipeline:
             "ORDER BY sighting_id DESC LIMIT 1",
             (source_id, track_id),
         ).fetchone()
-        if row is not None:
-            self._emit({"type": "sighting", "new": new, "sighting": dict(row)})
+        if row is None:
+            return None
+        stored = dict(row)
+        self._emit({"type": "sighting", "new": new, "sighting": stored})
+        return stored
+
+    def _raise_alerts(self, conn, sighting):
+        """Check one committed row and publish whatever it raised.
+
+        Inside the writer, after the commit, on the writer's own connection --
+        so an alert is written by the one writer like everything else, and it
+        exists before the sighting event has finished being delivered.
+
+        A check that fails must cost its alert and nothing more. The row is
+        already committed and the sources are already running; taking the
+        writer down over a blacklist file somebody mistyped would stop the
+        whole app.
+        """
+        if sighting is None:
+            return
+        try:
+            for alert in alert_rules.evaluate(conn, sighting, self.blacklist):
+                self._emit({"type": "alert", "alert": alert})
+        except Exception as exc:  # noqa: BLE001 - never into the writer
+            print(f"[writer] alert check failed: {type(exc).__name__}: {exc}")
 
     def _apply(self, conn, message):
         kind = message.get("type")
         if kind == "sighting":
             row = {k: message.get(k) for k in SIGHTING_COLUMNS}
             if message.get("update") and self._extend_sighting(conn, row):
-                self._emit_sighting(conn, row["source_id"], row["track_id"], new=False)
+                stored = self._emit_sighting(
+                    conn, row["source_id"], row["track_id"], new=False
+                )
+                # An extended row can carry a plate the first emission did not,
+                # so an update is checked like any other commit. record() is
+                # what stops the same alert being written twice.
+                self._raise_alerts(conn, stored)
                 return
             conn.execute(
                 f"INSERT INTO sightings ({', '.join(SIGHTING_COLUMNS)}) "
@@ -489,7 +527,8 @@ class Pipeline:
             conn.commit()
             sid = row["source_id"]
             self.counts[sid] = self.counts.get(sid, 0) + 1
-            self._emit_sighting(conn, sid, row["track_id"], new=True)
+            stored = self._emit_sighting(conn, sid, row["track_id"], new=True)
+            self._raise_alerts(conn, stored)
         elif kind == "status":
             conn.execute(
                 "UPDATE sources SET status = ?, error = ?, progress = ?, "

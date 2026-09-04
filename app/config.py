@@ -94,6 +94,18 @@ def sources_seed_path():
     return CONFIG_DIR / "sources.yaml"
 
 
+def blacklist_path():
+    """The plates alerts are raised on (P5).
+
+    Config rather than runtime state, and re-read on every sighting when its
+    mtime changes, so adding a registration takes effect within seconds with
+    nothing to restart. Overridable through `paths.blacklist` so a test can
+    point at a throwaway file instead of the shipped one.
+    """
+    configured = load_settings()["paths"].get("blacklist")
+    return configured if configured is not None else CONFIG_DIR / "blacklist.yaml"
+
+
 def default(key, fallback=None):
     return load_settings()["defaults"].get(key, fallback)
 

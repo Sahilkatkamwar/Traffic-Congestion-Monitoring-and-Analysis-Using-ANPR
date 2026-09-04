@@ -6,13 +6,16 @@ import EvidencePanel from '../components/EvidencePanel'
 import Empty from '../components/Empty'
 import { getAlerts, getSightings, getSources } from '../lib/api'
 import { openLiveFeed } from '../lib/socket'
-import { useRoute } from '../lib/router'
+import { Link, useRoute } from '../lib/router'
 
 // Full-bleed map with the feed floating over it. The panel is the only blurred
 // surface on the screen, which is what makes it read as floating rather than
 // as a column the map happens to sit beside.
 
 const FEED_LIMIT = 80
+// The strip is a glance, not the Alerts screen. Two are shown and the rest are
+// counted, so a burst of alerts cannot push the live feed off the panel.
+const ALERT_LIMIT = 20
 // How long a source keeps pulsing after it emitted. Long enough to notice,
 // short enough that a busy camera does not simply pulse forever.
 const PULSE_MS = 2200
@@ -44,7 +47,7 @@ export default function LiveScreen() {
       const [sourceRows, sightingRows, alertRows] = await Promise.all([
         getSources(),
         getSightings(FEED_LIMIT),
-        getAlerts(10),
+        getAlerts(ALERT_LIMIT),
       ])
       setSources(sourceRows)
       setSightings(sightingRows)
@@ -101,6 +104,16 @@ export default function LiveScreen() {
           if (event.new) {
             setNewIds((current) => new Set(current).add(row.sighting_id))
           }
+        } else if (event.type === 'alert') {
+          // P5. The writer publishes an alert straight after the sighting that
+          // raised it, so the strip fills within a second rather than on the
+          // next load. Newest first, and the same row is never added twice --
+          // a reconnect reloads and could otherwise duplicate what is here.
+          const row = event.alert
+          setAlerts((current) => {
+            const without = current.filter((a) => a.alert_id !== row.alert_id)
+            return [row, ...without].slice(0, ALERT_LIMIT)
+          })
         } else if (event.type === 'source') {
           const row = event.source
           setSources((current) => {
@@ -189,19 +202,36 @@ export default function LiveScreen() {
           </div>
         </header>
 
-        {/* Alert strip. Rows come from the alerts table, which P5 fills -- until
-            then there is nothing here and nothing is shown. */}
+        {/* Alert strip. The newest two, with the rest counted -- the whole list
+            is the Alerts screen's job and a strip that grew without bound would
+            push the live feed out of the panel. Colour is severity: the
+            government-plate red for critical, the commercial yellow for
+            everything else, exactly as the Alerts screen spends them. */}
         {alerts.length > 0 && (
           <div className="mt-3 px-4">
             {alerts.slice(0, 2).map((alert) => (
-              <div
+              <Link
                 key={alert.alert_id}
-                className="mb-1.5 rounded-control bg-plate-red/15 px-3 py-2 text-[13px] text-ink-hi"
+                to="/alerts"
+                className={`mb-1.5 block rounded-control px-3 py-2 text-[13px] text-ink-hi ${
+                  alert.severity === 'critical' ? 'bg-plate-red/20' : 'bg-plate-yellow/15'
+                }`}
+                title="Open the Alerts screen"
               >
-                <span className="font-plate tracking-plate">{alert.plate_text}</span>
+                <span className="font-plate tracking-plate font-semibold">
+                  {alert.plate_text}
+                </span>
                 <span className="ml-2 text-ink-mid">{alert.detail}</span>
-              </div>
+              </Link>
             ))}
+            {alerts.length > 2 && (
+              <Link
+                to="/alerts"
+                className="mb-1.5 block px-1 text-[12px] text-ink-mid hover:text-ink-hi"
+              >
+                {alerts.length - 2} more alert{alerts.length - 2 === 1 ? '' : 's'} →
+              </Link>
+            )}
           </div>
         )}
 

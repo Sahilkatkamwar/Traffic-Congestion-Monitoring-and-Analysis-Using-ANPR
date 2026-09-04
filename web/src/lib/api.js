@@ -46,7 +46,23 @@ const patch = json('PATCH')
 export const getHealth = () => get('/api/health')
 export const getSources = () => get('/api/sources')
 export const getSightings = (limit = 80) => get(`/api/sightings?limit=${limit}`)
-export const getAlerts = (limit = 20) => get(`/api/alerts?limit=${limit}`)
+// --- alerts (P5) -----------------------------------------------------------
+//
+// Every alert arrives with the sightings it is about already attached: an
+// impossible transition is unreadable without both crops, both timestamps, the
+// distance and the speed, and a second round trip per alert to fetch them would
+// let the pair and the arithmetic disagree.
+
+export function getAlerts(limit = 20, { kind = null, severity = null } = {}) {
+  const query = new URLSearchParams({ limit: String(limit) })
+  if (kind) query.set('kind', kind)
+  if (severity) query.set('severity', severity)
+  return get(`/api/alerts?${query.toString()}`)
+}
+
+// What the writer is currently matching against, read straight from the file
+// it re-reads. There is no write here on purpose: the file is the control.
+export const getBlacklist = () => get('/api/blacklist')
 
 // --- sources (P4b) ---------------------------------------------------------
 

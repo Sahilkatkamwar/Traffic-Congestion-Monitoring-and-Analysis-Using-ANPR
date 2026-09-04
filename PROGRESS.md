@@ -2009,3 +2009,197 @@ does not produce them.
 
 Ready for P5 (Alerts: blacklist matching on write, impossible-transition
 detection, the Alerts screen) once `web/dist` is rebuilt.
+
+# P5 - Alerts
+
+**Scope.** CLAUDE.md's P5 is *Insights and Alerts*. Insights shipped in P4e and
+is untouched here -- `scratch/p4e_verify.py` is its suite and it still runs. This
+phase is the Alerts half: blacklist matching on write, impossible-transition
+detection from source distance and elapsed time, and the Alerts screen.
+
+## Exit criteria - verified
+
+> a blacklisted plate raises a visible alert within seconds of its sighting
+
+`scratch/p5_verify.py`, **109 checks passed, 0 failed, 0 skipped, 19s**
+(`scratch/p5_verify.log`). Sections A-H run against a throwaway database; section
+I is the exit line itself, measured through the real pipeline on real footage.
+
+**The measured answer is 0.016 s.**
+
+Section I does not take the plate from a document, because a document can go
+stale under an OCR change. It runs `footage/clips/20 sec.mp4` twice through real
+worker processes:
+
+| | |
+|---|---|
+| run 1, empty blacklist | 11 sightings, 2 plate reads, **0 alerts** -- the control |
+| the plates that clip actually read | `MH15BY2231` 0.72, `MH15HY2277` 0.56 |
+| blacklist edited **while the app is running** | watching `MH15BY2231` |
+| run 2, same clip, same code | **critical alert raised**, reason from the file in the sentence |
+| sighting committed to alert row written | **0.016 s**, against a 5 s deadline |
+| the alert on the websocket | 1 event, so the Live strip fills with no poll |
+| impossible transitions invented on two unplaced sources | **0** |
+
+The latency is taken at the two moments rather than from `created_ts`: that
+column has millisecond resolution and the distance being measured is smaller
+than one millisecond tick.
+
+| check | result |
+|---|---|
+| A surface | both routes validate and answer in sentences: an unknown kind names the two that exist, an unknown severity names the three |
+| B the file is the control | both entry shapes, normalisation, hot reload with no restart, and **every bad line named with its reason** |
+| ...a broken file is an ERROR | not silently an empty blacklist -- the failure mode that matters |
+| C matching | exact gives `critical`, one confusable glyph gives `warning` with its cost, a hit through `plate_candidates` says so |
+| ...the gate, on the pairs it was set from | `HR15B1238`/`HR15B1738` 1.00 matched, `HR03A7979`/`HR03X7979` 1.00 matched, `HR15B1738`/`MP15B1738` **1.35 refused** |
+| D transitions | 1.3256 km in 4.0 s = **1193 km/h**, the same arithmetic P4d checks, to the digit |
+| ...and every case that must not alert | 39.8 km/h, two cameras 22 m apart, an unplaced camera, one camera twice, two different vehicles close in time -- **all silent** |
+| ...one vehicle, two cameras, one instant | `critical`, and the sentence says "at the same moment" rather than printing an infinite speed |
+| E dedup | a re-emitted track writes one alert; a pair reached from either end is one alert |
+| ...and the route is read-only | reading writes nothing, and the route body contains no INSERT/UPDATE/DELETE |
+| F hydration | both crops, both timestamps, distance, speed, the limit, in clock order |
+| ...an alert outliving its evidence | names what is missing rather than pointing at nothing |
+| G deep link | `/alerts` survives a reload, `/api/` is still not swallowed, and the built bundle carries the screen |
+| H node | all four changed frontend files parse |
+
+## What was built
+
+| file | what |
+|---|---|
+| `app/alerts.py` | was an empty stub; now both checks, the watched file, and hydration |
+| `app/pipeline.py` | the checks run on the writer thread, in the commit path |
+| `app/api.py` | `/api/alerts` hydrated and filterable, `/api/blacklist` |
+| `app/config.py` | `blacklist_path()` |
+| `app/matching.py` | `plate_forms`, a public name for `_stored_forms` |
+| `config/blacklist.yaml` | was empty; now the documented file, shipping empty |
+| `config/settings.yaml` | `paths.blacklist` and four `alert_*` defaults |
+| `web/src/components/AlertCard.jsx` | was empty; now both kinds, paired evidence |
+| `web/src/screens/AlertsScreen.jsx` | was its placeholder; now the screen |
+| `web/src/screens/LiveScreen.jsx` | the strip fills off the socket |
+| `web/src/lib/api.js` | `getAlerts` filters, `getBlacklist` |
+
+**No field was added to `sightings` and no table was added.** The data contract
+is the same three tables it has been since P0.
+
+## Decisions, and what each one refuses
+
+**The gate is an edit COST, not a similarity score, and the number was measured
+rather than chosen.** `matching.similarity` normalises by length, so one
+tolerance means different things on an 8- and an 11-character plate. Over the 43
+distinct plate strings in `data/anpr.db`:
+
+    HR15B1238 / HR15B1738   1.00   one vehicle, read twice
+    HR03A7979 / HR03X7979   1.00   one vehicle, read twice
+    HR15B1738 / MP15B1738   1.35   TWO vehicles -- different state code
+
+1.0 takes both re-reads and refuses the cross-state pair. As similarity those
+same three are 0.889, 0.889 and 0.850 -- a **0.039** band to sit a threshold in,
+which is the length dependence showing. Never string equality: the camera that
+read `MH15HY22` and the entry that says `MH15HY2237` are the same vehicle.
+
+**Severity is a claim about certainty, not a decoration.** `critical` is only
+for a hit needing no interpretation: a character-for-character read of the
+entry, or a vehicle at two separated cameras at one instant. Everything reached
+by fuzzy matching is capped at `warning` and prints its cost against the limit,
+because whoever reads it has to be able to disagree with it. A blacklist entry
+may ask for a lower severity; it can never raise one.
+
+**The checks run inside the commit path, on the writer thread.** "Within seconds
+of its sighting" is not achievable by polling, and the alert has to be written
+by the one writer like everything else. They are wrapped: a failing check costs
+its alert and never the writer, because stopping the writer stops every source.
+
+**The blacklist is a file, re-read on mtime, and the file is the interface.**
+Asked, the decision was config over a fourth table. So the screen names the path
+instead of offering an add button, and an edit takes effect on the next sighting
+with nothing to restart -- verified in section I by editing it mid-run. The
+stamp carries size as well as mtime: two saves inside one filesystem tick are
+real on Windows, and a blacklist edit that does not take effect is the failure
+this whole mechanism exists to avoid.
+
+**A file that does not parse is an error that is reported, not an empty
+blacklist.** A watch list that silently became empty is worse than one that says
+it is broken. Every unusable line is kept with its reason and shown on the
+screen.
+
+**Alerts are hydrated in the read route, not stored wide.** An impossible
+transition is unreadable without both crops, both timestamps, the distance and
+the speed, and none of that belongs in the frozen seven columns. It is derived
+from the sightings the alert names, so the table stays as it was and the screen
+still gets what it has to show.
+
+**The transition leg is `last_seen` to `first_seen`**, the same convention
+`app/trajectory.py` uses. Charging the vehicle for the time it spent inside the
+first camera's view would understate every speed. Checked to the digit against
+`haversine_km` in section D.
+
+**An unplaced camera raises nothing.** It has no distance to anywhere. That is
+not an error and not a reason to invent one -- the same refusal that keeps an
+unplaced source off the map in P4b, P4d and P4e.
+
+**The blacklist ships empty.** A plate in it that nobody chose would raise an
+alert about a real vehicle in the footage, which is the "never render data
+nobody asked for" rule pointed at configuration. Two plates this database
+actually read are in the file as commented examples, so watching it work is one
+uncommented line.
+
+## Regression - 490 passed, 3 failed
+
+    p1_verify              21/22   the documented environmental failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision  14/14
+    p2_verify              33/34   the documented ocr_tworow500 calibration failure
+    p3_verify              57/57
+    p4a_verify             25/25
+    p4b_verify             74/74
+    p4c_verify             75/75   was 74/75 -- the deep link passes now dist is built
+    p4d_verify             79/81   two failures, NOT this phase -- see below
+    p4e_verify            128/129  one failure, NOT this phase -- see below
+    p5_verify             109/109
+
+Logs in `scratch/p5/`. Two of the three failures are the ones CLAUDE.md already
+records: `p1_verify`'s webcam check needs a vehicle in front of the lens, and
+`p2_verify` inspects the highest-confidence plated row on `20 sec.mp4`, which
+since the OCR promotion is a truck with no legible plate.
+
+**The p4d and p4e failures are the application database, not the code, and that
+was established rather than assumed.** Both are in those suites' "real data"
+sections, which read `data/anpr.db` directly. That database is no longer the one
+P4e measured -- it now holds **346 sightings from 1 source, with no coordinates
+and no `MH15JS4241`** -- so `p4d_verify` asks for a multi-stop journey by a plate
+that is not there, and `p4e_verify` asks for origin-destination flows across a
+single camera. **Re-running both suites with every P5 change stashed produced the
+identical counts, 79/2 and 128/1.** Both go green again on a database with two
+placed sources in it; neither is a code change.
+
+## Runnable
+
+`app/run.py`'s own startup path -- `ensure_dirs`, `init_db`, `seed_sources`, a
+real `Pipeline`, `create_app` -- against the real application database:
+
+    200  /api/health     {"status":"ok","db":true,"sources":1,"sightings":346,"ui_built":true}
+    200  /api/alerts     []
+    200  /api/blacklist  {"path":"config/blacklist.yaml","count":0,"error":null}
+    200  /alerts         the built UI
+
+It ran on port **8016**, not 8000, because **a python process started at 14:16
+is still holding 8000** and it is running pre-P5 code -- `/api/blacklist` answers
+`No API route` on it. That is the trap P0 recorded: a stale server on this
+machine needs `taskkill`, not `kill`. Stopping it and running
+`python -m app.run` again is what puts P5 in a browser.
+
+## Current state
+
+`data/anpr.db` is exactly as this session found it -- 1 source, 346 sightings, 0
+alerts. `p5_verify` uses a throwaway database and a throwaway blacklist file, and
+removes the crops its two worker runs wrote.
+
+`config/blacklist.yaml` ships empty. `config/settings.yaml` gained
+`paths.blacklist` and four `alert_*` defaults and changed nothing that existed.
+Every model file and the whole inference pipeline are untouched: no benchmark was
+run and none was needed -- this phase reads rows and writes alerts, it does not
+produce sightings.
+
+`web/dist` is built. The P4e session could not build it; `npm run build` finished
+here in 1.6s, so that was an environment limit on child processes in that
+session and it is gone.

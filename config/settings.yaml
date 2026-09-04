@@ -67,6 +67,11 @@ paths:
   # Videos and stills uploaded from the Sources screen. Inside footage/ because
   # an uploaded clip is footage like any other.
   uploads:        footage/uploads
+  # P5. The plates alerts are raised on. Config rather than runtime state, and
+  # re-read whenever its mtime changes, so adding a registration takes effect
+  # on the next sighting with nothing to restart. Named here so a test can
+  # point at a throwaway file instead of the shipped one.
+  blacklist:      config/blacklist.yaml
   # P4c. Annotated frames, crops and the result document for one Analyze job.
   # Not evidence: nothing here belongs to a sighting, and a job's directory is
   # deleted with the job. Kept out of crops/ for exactly that reason -- a crop
@@ -376,6 +381,46 @@ defaults:
   # never strided, only the pictures of them.
   analyze_max_frames: 600
   analyze_frame_width: 720
+
+  # --- alerts (P5) ----------------------------------------------------------
+  # How close a stored read has to be to a plate before the two are treated as
+  # the same vehicle. This is a confusion-weighted EDIT COST, not a similarity
+  # score: a swap between glyphs OCR actually confuses costs 0.35 and a real
+  # character difference costs 1.0, so 1.0 admits one genuine character of
+  # error or up to two confusable ones.
+  #
+  # A cost rather than a score because a score normalises by length, and the
+  # same tolerance then means one thing on an 8-character plate and another on
+  # an 11-character one. Measured over the 43 distinct plate strings in the
+  # application database:
+  #
+  #     HR15B1238 / HR15B1738   1.00   one vehicle, read twice
+  #     HR03A7979 / HR03X7979   1.00   one vehicle, read twice
+  #     HR15B1738 / MP15B1738   1.35   TWO vehicles -- different state code
+  #
+  # 1.0 takes both genuine re-reads and refuses the cross-state pair. As
+  # similarity those same three are 0.889, 0.889 and 0.850 -- a 0.039 band to
+  # sit a threshold in, which is the length dependence showing.
+  #
+  # Used by both checks. A blacklist entry is a string a person typed, so only
+  # one side of that comparison is noisy; two OCR reads scored against each
+  # other are noisy on both sides and could justify a wider gate. They share
+  # this one, erring towards refusing a match: a missed alert is a missed
+  # alert, a wrong one puts the wrong vehicle in front of whoever reads it.
+  alert_match_distance: 1.0
+  # Above this between two placed cameras, the journey did not happen. Well
+  # clear of anything an Indian road produces and far under the four-figure
+  # numbers a mismatched pair of reads generates, so the alert fires on the
+  # arithmetic being absurd rather than on the vehicle being quick.
+  alert_max_speed_kmh: 200.0
+  # Two cameras closer together than this are watching the same place. A
+  # vehicle crossing 30 m between two frames is 108 km/h and is not evidence.
+  alert_min_distance_km: 0.05
+  # How far either side of a sighting a transition is looked for. A pair a day
+  # apart cannot be an impossible transition however far apart the cameras
+  # are, and scanning the whole table on every committed row would put a
+  # growing cost inside the one writer.
+  alert_transition_window_sec: 3600
 
   # --- vehicle type classifier ----------------------------------------------
   # Only consulted when models.vehicle_classes is set. Below the floor the

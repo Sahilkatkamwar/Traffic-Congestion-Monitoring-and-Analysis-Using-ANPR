@@ -167,6 +167,13 @@ def _stored_forms(row):
     return forms
 
 
+# Public name for the same thing. P5's alerts match a blacklist entry against
+# every string a sighting offers, exactly as the search does, and importing a
+# module-private helper across the package would be borrowing rather than an
+# interface.
+plate_forms = _stored_forms
+
+
 def _score_row(row, forms):
     """Best (score, matched text, how) for one sighting against the query.
 

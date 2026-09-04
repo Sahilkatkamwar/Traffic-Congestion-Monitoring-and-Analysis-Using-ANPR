@@ -1,0 +1,43 @@
+# Registrations to raise an alert on the moment they are seen.
+#
+# This file is re-read whenever it changes -- there is nothing to restart and no
+# button to press. Save a plate here and the next sighting that matches it
+# raises an alert within seconds. The Alerts screen shows what is currently
+# loaded, and says so if a line could not be used.
+#
+# Matching is never string equality. A camera reads the same vehicle as
+# MH15HY2237 at one source and MH15HY22 at another, so an equality test answers
+# "not seen" about a vehicle that is sitting in the database. A read within one
+# confusion-weighted character of an entry here is a hit -- and it is reported
+# as a `warning` saying how far off it was, never as `critical`, because whoever
+# reads it has to be able to disagree with it. Only a character-for-character
+# match on the voted plate is `critical`.
+#
+# The list ships empty on purpose: this app never invents data, and a plate here
+# that nobody chose would raise an alert about a real vehicle in the footage.
+#
+# Each entry is either a bare registration:
+#
+#   plates:
+#     - MH15JS4241
+#
+# or a mapping, when the alert should carry a reason or a lower severity:
+#
+#   plates:
+#     - plate: MH15JS4241
+#       reason: reported stolen 2026-08-14
+#       severity: critical      # critical (default) / warning / info
+#
+# `reason` is shown in the alert text, so write it for whoever reads the alert
+# rather than for whoever wrote the list.
+#
+# To watch this working on the footage already processed into this database,
+# uncomment one of these -- they are plates the pipeline actually read -- then
+# re-run that source, or run a new one:
+#
+#   - plate: PB03BE1800
+#     reason: example entry, delete this
+#   - plate: CH01AF6401
+#     reason: example entry, delete this
+
+plates: []

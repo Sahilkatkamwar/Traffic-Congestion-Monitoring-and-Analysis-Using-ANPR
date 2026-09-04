@@ -41,6 +41,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from app import (
+    alerts as alert_rules,
     analytics,
     analyze as analysis,
     config,
@@ -222,19 +223,71 @@ def create_app(pipeline=None):
         return dict(row)
 
     @app.get("/api/alerts")
-    def alerts(limit: int = Query(50, ge=1, le=500)):
-        """Read-only. P5 is what writes rows here; until then this is empty,
-        and the Live screen's alert strip renders nothing rather than something
-        invented."""
+    def alerts(
+        limit: int = Query(50, ge=1, le=500),
+        kind: str | None = Query(None),
+        severity: str | None = Query(None),
+    ):
+        """Alerts, newest first, each carrying the evidence it is about.
+
+        Read-only. The writer raises these inside the commit path -- see
+        app/alerts.py -- and this route only reads them back.
+
+        The rows are hydrated rather than returned bare: an impossible
+        transition is unreadable without both crops, both timestamps, the
+        distance and the speed, and none of that is in the alerts table by
+        contract. It is derived from the sightings the alert names, so the
+        table stays the frozen seven columns.
+        """
+        if kind is not None and kind not in ("blacklist", "impossible_transition"):
+            return fail(
+                400,
+                f"{kind!r} is not a kind of alert. Use 'blacklist' or "
+                f"'impossible_transition', or leave it off for both.",
+            )
+        if severity is not None and severity not in alert_rules.SEVERITIES:
+            return fail(
+                400,
+                f"{severity!r} is not a severity. Use one of "
+                f"{', '.join(alert_rules.SEVERITIES)}.",
+            )
+
+        where, params = [], []
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind)
+        if severity is not None:
+            where.append("severity = ?")
+            params.append(severity)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+
         conn = db.connect()
         try:
             rows = conn.execute(
-                "SELECT * FROM alerts ORDER BY created_ts DESC, alert_id DESC LIMIT ?",
-                (limit,),
+                f"SELECT * FROM alerts {clause} "
+                f"ORDER BY created_ts DESC, alert_id DESC LIMIT ?",
+                (*params, limit),
             ).fetchall()
+            return alert_rules.hydrate(conn, rows)
         finally:
             conn.close()
-        return [dict(row) for row in rows]
+
+    @app.get("/api/blacklist")
+    def blacklist():
+        """What is currently being watched, and where to change it.
+
+        The list is a file, re-read whenever it changes, so this reports what
+        the writer would match against right now -- including the lines it could
+        not use and why. The screen shows the path because the path is the
+        control: there is no button, the file IS the interface.
+
+        The pipeline's own instance is asked when there is one, so this cannot
+        disagree with what alerts are actually raised against.
+        """
+        watcher = (
+            pipeline.blacklist if pipeline is not None else alert_rules.Blacklist()
+        )
+        return watcher.describe()
 
     # -------------------------------------------------------- sources (P4b)
 
