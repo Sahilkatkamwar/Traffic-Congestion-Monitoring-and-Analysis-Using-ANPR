@@ -41,6 +41,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from app import (
+    analytics,
     analyze as analysis,
     config,
     db,
@@ -859,6 +860,47 @@ def create_app(pipeline=None):
         conn = db.connect()
         try:
             return trace.trajectory(conn, wanted, min_score=min_score, limit=limit)
+        finally:
+            conn.close()
+
+    # ---------------------------------------------------------- insights (P4e)
+
+    # One route, not five. Every panel on the Insights screen is a slice of the
+    # same window, and five routes would let them answer for five slightly
+    # different ones -- a source list fetched a second after the chart, with a
+    # worker still writing, disagreeing with it by two rows. A shared time
+    # filter has to be shared in the data, not only in the control.
+
+    @app.get("/api/insights")
+    def insights(
+        start: str | None = Query(None, alias="from"),
+        end: str | None = Query(None, alias="to"),
+        bucket: int | None = Query(None, ge=1, le=2592000),
+        min_score: float = Query(analytics.LINK_SCORE, ge=0.5, le=1.0),
+    ):
+        """Every panel, over one window of time.
+
+        `from` and `to` are ISO-8601 and both optional: no window at all means
+        everything there has ever been, which is what the screen opens on.
+        """
+        opened, error = analytics.parse_ts(start)
+        if error:
+            return fail(400, error)
+        closed, error = analytics.parse_ts(end)
+        if error:
+            return fail(400, error)
+        if opened and closed and opened > closed:
+            return fail(
+                400,
+                "The window ends before it starts. Swap the two times, or clear "
+                "one of them.",
+            )
+
+        conn = db.connect()
+        try:
+            return analytics.insights(
+                conn, start=opened, end=closed, bucket=bucket, min_score=min_score
+            )
         finally:
             conn.close()
 

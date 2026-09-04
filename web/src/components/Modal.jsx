@@ -7,6 +7,11 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 //
 // Not blurred: only panels floating over the map are. This floats over the
 // page, so it takes elevation and a scrim instead.
+//
+// The panel is height-flexible: max-h-full is the viewport less the scrim's
+// padding, header and footer are fixed, and the body scrolls. So a flow that
+// opens more fields than another grows the dialog until it runs out of room and
+// then scrolls inside it, rather than running off the bottom of the screen.
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
@@ -51,7 +56,7 @@ export default function Modal({ open, title, sub, onClose, children, footer, wid
     <AnimatePresence>
       {open && (
         <motion.div
-          className="fixed inset-0 z-[900] flex items-start justify-center overflow-y-auto p-4 sm:p-8"
+          className="fixed inset-0 z-[900] flex items-center justify-center p-4 sm:p-8"
           initial={reduced ? false : { opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={reduced ? { opacity: 1 } : { opacity: 0 }}
@@ -72,10 +77,10 @@ export default function Modal({ open, title, sub, onClose, children, footer, wid
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={reduced ? { opacity: 1 } : { opacity: 0, y: 8, scale: 0.99 }}
             transition={reduced ? { duration: 0 } : { type: 'spring', stiffness: 420, damping: 34 }}
-            className={`relative my-auto w-full rounded-card bg-surface-1 shadow-float outline-none
-              ${wide ? 'max-w-3xl' : 'max-w-lg'}`}
+            className={`relative flex max-h-full w-full flex-col overflow-hidden rounded-card
+              bg-surface-1 shadow-float outline-none ${wide ? 'max-w-3xl' : 'max-w-lg'}`}
           >
-            <header className="flex items-start justify-between gap-4 px-6 pt-5 pb-4">
+            <header className="flex shrink-0 items-start justify-between gap-4 px-6 pt-5 pb-4">
               <div>
                 <h2 className="text-[19px] font-semibold leading-tight">{title}</h2>
                 {sub && <p className="mt-1 text-[13px] text-ink-mid">{sub}</p>}
@@ -91,10 +96,10 @@ export default function Modal({ open, title, sub, onClose, children, footer, wid
               </button>
             </header>
 
-            <div className="hairline-t px-6 py-5">{children}</div>
+            <div className="hairline-t min-h-0 flex-1 overflow-y-auto px-6 py-5">{children}</div>
 
             {footer && (
-              <div className="hairline-t flex items-center justify-end gap-2 px-6 py-4">
+              <div className="hairline-t flex shrink-0 items-center justify-end gap-2 px-6 py-4">
                 {footer}
               </div>
             )}

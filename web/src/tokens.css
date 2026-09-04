@@ -26,6 +26,20 @@
   --plate-green:  #12a45c;
   --plate-red:    #d34331;
 
+  /* Chart fills (P4e). Not a new palette -- these are the two grounds
+   * PlateString already uses, so a bar segment and an evidence card say the
+   * same thing in the same colour: a read plate sits on the plate-white
+   * ground, NO READ sits on slate.
+   *
+   * The slate is lifted from surface-3 to #7c8a99 for one measured reason: a
+   * chart fill has to clear 3:1 against the card it sits on, and surface-3
+   * does not. Checked with the dataviz palette validator against #161d26 --
+   * plate-white, plate-yellow and this separate at CVD delta-E 15.6 or better
+   * under every simulated deficiency, and all three clear the contrast floor.
+   * Every chart also labels its series, so identity is never colour alone. */
+  --viz-read: #f2f3ee;
+  --viz-unread: #7c8a99;
+
   /* One hairline is worth five boxes. */
   --hairline: rgba(255, 255, 255, 0.075);
 

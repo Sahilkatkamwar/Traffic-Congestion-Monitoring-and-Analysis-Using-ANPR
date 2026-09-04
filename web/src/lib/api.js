@@ -132,6 +132,25 @@ export const getTrajectory = (plate) =>
 
 export const getSighting = (id) => get(`/api/sightings/${encodeURIComponent(id)}`)
 
+// --- insights (P4e) --------------------------------------------------------
+//
+// One call, every panel. The time window is shared in the data rather than only
+// in the control: five calls would let five panels answer for five slightly
+// different slices while a worker is writing, and the whole promise of the
+// screen is that they cannot.
+//
+// Both ends are optional. No window at all means everything there has ever
+// been, which is what the screen opens on.
+
+export function getInsights({ from = null, to = null, minScore = null } = {}) {
+  const query = new URLSearchParams()
+  if (from) query.set('from', from)
+  if (to) query.set('to', to)
+  if (minScore != null) query.set('min_score', minScore)
+  const suffix = query.toString()
+  return get(`/api/insights${suffix ? `?${suffix}` : ''}`)
+}
+
 // crop_path is stored relative to the project root ('crops/evidence/...') and
 // FastAPI mounts that directory at /crops, so the stored value is the URL.
 export const cropUrl = (path) => (path ? `/${path}` : null)

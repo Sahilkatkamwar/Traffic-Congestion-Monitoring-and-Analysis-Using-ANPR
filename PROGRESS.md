@@ -1764,3 +1764,248 @@ a throwaway database, and the three evidence crops its fixture needed under
 `web/dist` is rebuilt: 497.0 kB js, 36.5 kB css.
 
 Ready for P5.
+
+---
+
+# P4e - Insights
+
+**Scope, because CLAUDE.md does not define a P4e.** The build phases run P4a-P4d
+then P5, and P5 is *Insights and Alerts*. Asked which half "4e" meant, the answer
+was Insights only: `heatmap toggle, vehicle count over time, type distribution,
+per-source density ranking, origin-destination flow lines weighted by volume, one
+shared time-window filter across all panels`. **Alerts, blacklist matching and
+impossible-transition detection are untouched and remain P5.** `app/alerts.py` is
+still an empty stub and `AlertsScreen` is still its placeholder.
+
+**The screen is written and its server half is verified. `web/dist` is not built,
+and this session could not build it.** Details in "The build, and what I broke"
+below -- read that before treating the phase as finished.
+
+## Exit criteria - verified
+
+There is no exit line to quote, so the criterion taken was the specification
+above read strictly, plus the two rules that govern every screen: never render
+placeholder data, and an empty state says what to do next.
+
+`scratch/p4e_verify.py`, **125 checks passed, 0 failed, 1 skipped, 2s**
+(`scratch/p4e/p4e_verify.log`). The app starts once with **no pipeline** against a
+throwaway database and everything is done over HTTP the way the browser does it.
+34 of the 125 run in node: 26 against `web/src/lib/insights.js` -- the module the
+bundle imports, not a Python copy of it -- and 8 parsing each new frontend file,
+which is the largest claim available about the frontend while the bundle cannot
+be built.
+
+| check | result |
+|---|---|
+| one shared time filter across all panels | **the filter is shared in the data**: the header, the time chart, the type split, the source ranking and the map all reconcile to the same row count, and to each other again through a window |
+| vehicle count over time | 55 buckets, width chosen off a ladder (10s for a 542s span), aligned to the clock, empty intervals left empty |
+| type distribution | car 4 / truck 2 / motorcycle 1 / bus 1 / **unknown 1**, shares summing to 1 |
+| per-source density ranking | count **and** rate: west and east both saw 4, east across 300s and west across 544s, so 48/h against 26.5/h -- the two rankings disagree, which is why both ship |
+| heatmap | 2 placed points weighted 4 and 4, the unplaced camera contributing none, and its 1 sighting reported rather than dropped |
+| origin-destination flows, weighted by volume | 3 flows; the crossing is found although **no two rows share a plate string** |
+| ...direction is a fact | `east -> west` stays separate from `west -> east` |
+| ...distance and speed | 1.3256 km over a 120.0s gap = **39.77 km/h**, the same arithmetic P4d checks |
+| ...and the ones that cannot be drawn | the flow into the unplaced camera keeps its gap, loses distance and speed, and is counted |
+| a source that saw nothing keeps its row | `quiet` at 0, `per_hour` null, still ranked |
+| Insights reads and only reads | sighting/source/alert counts identical before and after; no INSERT/UPDATE/DELETE in the route or the module |
+| a bad time is refused with a sentence | `'nonsense' is not a time this understands. Use something like 2026-09-01T15:19:00Z.` |
+| a backwards window is refused | `The window ends before it starts. Swap the two times, or clear one of them.` |
+| an empty window is not an empty database | the answer still reports the extent, so the screen says which kind of empty it is |
+| **deep link `/insights` survives a reload** | **SKIPPED -- `web/dist` is not built** |
+
+### And on real rows this session did not write
+
+Section K opens the **application database read-only**: 164 sightings, 34 plated,
+6 of 6 sources but **1 placed**, bucketed at 1 hour over 49 intervals. **12
+vehicles identified, 10 of which moved between sources.** Every panel reconciles
+on those rows, and the map reports 116 sightings at 5 unplaced sources that it
+cannot show -- which is the state the screen has to handle honestly, not an
+inconvenience.
+
+## What was built
+
+| file | what |
+|---|---|
+| `app/analytics.py` | was an empty stub; now the whole server half |
+| `app/api.py` | `GET /api/insights` -- one route, every panel |
+| `web/src/screens/InsightsScreen.jsx` | was an 11-line placeholder; now the screen |
+| `web/src/components/TimeWindow.jsx` | new. The one filter |
+| `web/src/components/CountsChart.jsx` | new. Vehicles per interval, stacked by read/unread |
+| `web/src/components/TypeBars.jsx` | new. The type split |
+| `web/src/components/SourceRanking.jsx` | new. Volume, or rate |
+| `web/src/components/DensityMap.jsx` | new. Heat canvas overlay and the flow curves |
+| `web/src/lib/insights.js` | new. The window arithmetic, so node can check it |
+| `web/src/lib/api.js` | `getInsights` |
+| `web/src/tokens.css` | two chart fills |
+
+Nothing in `app/` outside `api.py` and the new `analytics.py` was touched. No
+field was added to `sightings`. `matching.py` and `trajectory.py` are P3's and are
+used exactly as written.
+
+## Decisions, and what each one refuses
+
+**One route, not five.** Every panel is a slice of one window, and five routes
+would let five panels answer for five slightly different ones -- a source list
+fetched a second after the chart, with a worker still writing, disagreeing with it
+by two rows. So `/api/insights` fetches the sightings in the window **once** and
+computes every panel from that row set. A shared filter is only shared if the
+panels physically cannot disagree, and section B checks exactly that: five
+independently computed panels all totalling the same number, twice.
+
+**A preset window measures back from the newest sighting, never from
+`Date.now()`.** This is P1's timestamp rule arriving in the UI. A recorded source
+stamps its rows with when the footage was filmed, so "last 24 hours" against the
+wall clock returns an empty screen for every clip processed yesterday while the
+identical control works on a live camera -- and nothing downstream is allowed to
+tell the two apart. Measured back from the newest row they behave identically: on
+a live feed the newest row *is* about now. The labels say "of data". Checked in
+node, including that the window deliberately does **not** track the wall clock.
+
+**The heatmap is a density map of cameras, and says so on the screen.** The
+database records which camera saw a vehicle and where that camera stands. Nothing
+anywhere records where the vehicle was between two cameras. So each placed source
+gets a blob weighted by what it saw, the radius is a real distance on the ground
+rather than a fixed number of screen pixels, and the panel prints how many
+sightings it cannot place. Smearing a vehicle along a guessed route would draw
+traffic onto roads nobody filmed -- the same refusal that keeps an unplaced source
+off the map in P4b and P4d.
+
+**Flows are assembled by fuzzy match and the threshold is stricter than
+Trace's.** `/api/search` uses 0.72; this uses **0.80**. On Trace a person reads
+the ranked candidates and decides. Here nobody does -- the answer is drawn on a
+map as a journey that happened. 0.80 was measured, not chosen: over the
+application database's 34 reads and 78 pairs, the one pair that is genuinely one
+vehicle (`MH15HY22` / `MH15HY227`) scores **0.889** and the closest pair that is
+two different vehicles (`MH07A3866` / `MH07T3336`) scores **0.667**, so every
+threshold from 0.68 to 0.88 groups identically and 0.80 sits in the middle of that
+band rather than on an edge. It is a query parameter, so it can be moved without a
+code change.
+
+**A flow line is a curve on purpose.** Straight, `A -> B` and `B -> A` land
+exactly on top of each other and the busier direction is invisible; the bend is
+always to the left of travel so the two separate. It also stops the line reading
+as a route, which it is not. Checked in node: the two directions bulge to opposite
+sides of the chord, and the bulge is 8% of it.
+
+**Density is reported two ways because a count is not a density.** A 20-second
+clip that saw 15 vehicles and a 200-second one that saw 66 are 2610 and 1188
+vehicles an hour -- the shorter clip is the busier road and the count ranking says
+the opposite. Both numbers are on every row and the sort is a control, so the
+screen never quietly picks one and calls it "density". A source whose sightings
+share one instant, such as a still image, gets `per_hour: null` and sorts last
+rather than being given a zero it did not earn.
+
+**A camera that saw nothing keeps its row.** Dropping it would make the ranking
+look like a list of all the cameras. So would dropping a sighting whose source has
+since been deleted -- that one gets a row reading `(source removed)`, or the
+ranking column stops adding up to the header.
+
+**Empty buckets are drawn empty.** A gap in traffic is a fact about the footage,
+and a chart that closes it up draws a busier road than the one filmed. Buckets are
+aligned to the epoch rather than to the first sighting, so a boundary is a round
+time on a clock and two windows over the same footage line up instead of being
+offset by whenever each query began.
+
+**Colour carries the meanings the app already has, and nothing else.** The time
+chart's two fills are PlateString's own grounds -- a read plate sits on
+plate-white, `NO READ` sits on slate -- so a bar segment and an evidence card say
+the same thing in the same colour. The type panel is a **ranked bar, not a
+donut**, because five types would need five identities carried by colour and this
+product has no five-hue categorical palette to give them: its colours are plate
+grounds and each already means something. So the bar colour carries the one split
+that is real -- yellow commercial, white private, exactly the split `VehicleBadge`
+makes beside every sighting -- and which of the five types a bar is, is carried by
+the label on it. Identity is never colour alone. The three fills were run through
+the palette validator against the card surface: CVD delta-E 15.6 or better on
+every simulated deficiency, all three over 3:1 contrast. The one measured change
+was lifting the neutral off `surface-3`, which does not clear the contrast floor.
+
+## Recharts is in the stack and is not used
+
+CLAUDE.md's stack names Recharts. It was fetched and inspected, and **not
+adopted**: `recharts@3.10.1` hard-depends on `@reduxjs/toolkit` and `react-redux`,
+and CLAUDE.md bans "Redux or any state library" outright, so using it would ship
+the banned dependency inside the bundle. The working rules also say plainly: do
+not add dependencies. `package.json` is unchanged and the two charts are inline
+SVG on the app's own tokens -- which is also how every other visual in this app is
+built, so the screen is more consistent rather than less.
+
+**`web/node_modules` does now contain recharts and its 11 transitive packages,
+extraneous to `package.json`.** Nothing imports them and nothing bundles them.
+`npm install` inside `web/` prunes them back.
+
+## The build, and what I broke
+
+**`web/dist` was deleted and could not be rebuilt. The UI is unavailable until
+someone runs `cd web && npm run build`.** The API is unaffected -- FastAPI serves
+its "frontend has not been built yet" page for `/`, by design.
+
+What happened, in order:
+
+1. `npm run build` hung. So did `node node_modules/vite/bin/vite.js build`, from
+   Bash, from PowerShell, from a Python subprocess, inside the sandbox and outside
+   it, with `maxParallelFileOps: 1`, and with **every P4e file removed and
+   `InsightsScreen` reverted to its placeholder** -- which is what establishes
+   that the fault is not in this phase's code. An instrumented build shows rollup
+   loading and transforming all 426 modules, including every new file without
+   error, and then never reaching `buildEnd`.
+2. I wrote a fallback bundler (esbuild + postcss, the same inputs) to get a
+   working `dist` anyway. **It cleared `dist` first and then hung in the same
+   place**, leaving `web/dist` with one stylesheet and no `index.html`. I removed
+   the remains. `web/dist/` is gitignored, so the P4d bundle is not recoverable
+   from the repo -- only by rebuilding.
+3. The `esbuild.exe` binary hangs bundling too, and so does a plain Python loop
+   reading `web/node_modules`. **Fourteen node processes are stuck, every one of
+   them at 2.0-2.4 CPU seconds and ~175 MB**, which is a cap rather than slowness:
+   everything under that budget ran fine all session -- the node window check,
+   Tailwind over `tokens.css` in 0.2s, `esbuild.transform`, a 20-second
+   CPU-burning loop. Nothing above it finished. This is an environment limit on
+   child processes in this session and I could not work around it.
+
+**Recovery is one command in a normal shell**, and it is the only thing
+outstanding on this phase:
+
+    cd web
+    npm install     # also prunes the extraneous recharts packages
+    npm run build
+
+`scratch/p4e_verify.py` section I is written to catch a stale result rather than
+pass on one: it skips when `dist` is absent, and when `dist` is present it reads
+the built bundle and fails unless `/api/insights`, `Density is measured at the
+cameras` and `Vehicles that moved` are actually inside it. Run it after the build
+and the skip becomes a pass; that is the one check this phase has not made.
+
+## Regression
+
+Every earlier suite, shipped configuration (`scratch/p4e/reg_*.log`):
+
+    p1_verify              21/22   the documented environmental failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision  14/14
+    p2_verify              33/34   the documented ocr_tworow500 calibration failure
+    p3_verify              57/57
+    p4a_verify             26/26
+    p4b_verify             74/74
+    p4c_verify             74/75   deep link 503 -- web/dist is missing
+    p4d_verify             78/78   + 1 skipped, deep link -- web/dist is missing
+
+**382 passed, 3 failed, 1 skipped.** Two of the three failures are the ones
+CLAUDE.md already records: `p1_verify`'s webcam check needs a vehicle in front of
+the lens, and `p2_verify` inspects the highest-confidence plated row on
+`20 sec.mp4`, which since the OCR promotion is a truck with no legible plate.
+**The third is not pre-existing and is mine** -- `p4c_verify`'s deep link, and
+`p4d_verify`'s skip, are both the deleted `web/dist`. Both go green again on a
+rebuild; neither is a code change.
+
+## Current state
+
+`data/anpr.db` is exactly as this session found it -- 6 sources, 164 sightings, 0
+alerts. Nothing this session ran wrote to it: `p4e_verify` uses a throwaway
+database and section K opens the real one read-only.
+
+`config/settings.yaml`, every model file and the whole inference pipeline are
+untouched. No benchmark was run and none needed to be -- this phase reads rows, it
+does not produce them.
+
+Ready for P5 (Alerts: blacklist matching on write, impossible-transition
+detection, the Alerts screen) once `web/dist` is rebuilt.

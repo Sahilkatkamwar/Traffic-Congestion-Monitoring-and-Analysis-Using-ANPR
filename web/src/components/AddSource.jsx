@@ -236,7 +236,7 @@ export default function AddSource({ open, onClose, onAdded, sources }) {
         </>
       }
     >
-      <div className="grid gap-5 md:grid-cols-[15rem_1fr]">
+      <div className="grid gap-5 md:grid-cols-[15rem_minmax(0,1fr)]">
         <div className="flex flex-col gap-2">
           {FLOWS.map((option) => (
             <Radio
@@ -255,7 +255,7 @@ export default function AddSource({ open, onClose, onAdded, sources }) {
           ))}
         </div>
 
-        <div className="flex flex-col gap-4">
+        <div className="flex min-w-0 flex-col gap-4">
           {flow === 'live' && (
             <LiveFlow
               uri={uri}
@@ -295,7 +295,7 @@ export default function AddSource({ open, onClose, onAdded, sources }) {
             />
           </Field>
 
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
             {flow === 'recorded' && (
               <Field
                 label="Recorded at"
@@ -552,7 +552,7 @@ function FileFlow({ flow, uri, setUri, name, setName, files, uploading, onUpload
       )}
 
       {uri && (
-        <p className="text-[12.5px] text-ink-mid">
+        <p className="break-words text-[12.5px] text-ink-mid">
           Selected <span className="text-ink-hi">{uri}</span>
         </p>
       )}

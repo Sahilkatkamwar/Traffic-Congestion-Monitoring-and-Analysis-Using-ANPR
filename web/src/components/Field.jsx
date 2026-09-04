@@ -5,7 +5,7 @@ import { useId } from 'react'
 
 export function Field({ label, hint, error, children }) {
   return (
-    <label className="block">
+    <label className="block min-w-0">
       <span className="label block">{label}</span>
       <span className="mt-1.5 block">{children}</span>
       {error ? (
