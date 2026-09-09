@@ -27,7 +27,16 @@ crosses the boundary.
 
 One job runs at a time. The card is 6 GB and has to hold three streams; a
 fourth model set loaded because two people pressed Analyze is how that budget
-is spent twice. Later submissions queue and say so.
+is spent twice. Later submissions queue and say so -- as runs of their own,
+each listed with its own progress, not as something the screen forgets about
+while it waits.
+
+P6 makes a run outlive the request that started it. `analyze_runs` records what
+was analysed, how it went, and where the saved result document and thumbnail
+are; the job directory holds the frames, the crops and that document. That is
+the only thing this module puts in the database, it goes through the one writer
+like every other write in the app, and it is still not a sighting -- see the
+paragraph above, which P6 does not soften.
 """
 
 import csv
@@ -39,12 +48,11 @@ import shutil
 import threading
 import time
 import traceback
-import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app import config, grammar, sources as source_rules
+from app import config, grammar, runs as run_store, sources as source_rules
 
 # Offsets into the media are what an analysis actually knows. The tracks and the
 # stitcher are written against datetimes, so they get one -- counted from the
@@ -58,11 +66,22 @@ CANCEL_GRACE_SEC = 10.0
 # second and a message per frame is noise.
 PROGRESS_EVERY_SEC = 0.4
 
-# Jobs kept in memory. Old ones are evicted oldest-first with their directories,
-# because the frames of a 200s clip are 35 MB apiece and nothing here is
-# persistent state -- a restart loses every job, which is why the directory is
-# also swept at startup.
-MAX_JOBS = 12
+# How many runs are kept. Past this the oldest FINISHED run is dropped with its
+# directory, because the frames of a 200s clip are about 35 MB and a screen that
+# never forgets fills the disk. A run still queued or running is never evicted;
+# a run the user has not deleted is only evicted by this cap.
+DEFAULT_KEEP = 50
+
+# The run list shows a still of each run. Small on purpose: fifty of these load
+# at once when the screen opens.
+THUMBNAIL_NAME = "thumb.jpg"
+THUMBNAIL_WIDTH = 320
+
+# A running job's progress is persisted no faster than this. The screen polls
+# the live value, which moves at PROGRESS_EVERY_SEC; the row only has to be
+# close enough that a run interrupted by a crash does not look like it never
+# started.
+PERSIST_EVERY_SEC = 2.0
 
 # Where a job's frames and crops are served from. NOT `/analyze`: that is the
 # frontend's own route, and a StaticFiles mount there would swallow
@@ -107,6 +126,20 @@ def _write_frame(path, image, max_width):
         return None
     path.write_bytes(buf.tobytes())
     return image.shape[1], image.shape[0]
+
+
+def _write_thumbnail(out_dir, image):
+    """A small still of the first annotated frame, for the run list.
+
+    Written by the child because the child is the only thing holding pixels, and
+    written from the FIRST frame rather than a representative one: the list has
+    to show something the moment a long video starts, and "representative"
+    cannot be known until the run is over.
+    """
+    path = out_dir / THUMBNAIL_NAME
+    if _write_frame(path, image, THUMBNAIL_WIDTH) is None:
+        return None
+    return path
 
 
 def _normalised(box, width, height):
@@ -382,6 +415,9 @@ def run_analysis(job, out, stop_event):
             for track in list(tracks.values()):
                 emit(track)
             size = _write_frame(dirs["frames"] / "000000.jpg", frame, frame_width)
+            thumb = _write_thumbnail(out_dir, frame)
+            if thumb is not None:
+                say(type="thumbnail", path=str(thumb))
             frames_out.append(
                 {
                     "i": 0,
@@ -519,6 +555,10 @@ def run_analysis(job, out, stop_event):
                         size = _write_frame(
                             dirs["frames"] / name, frame, frame_width
                         )
+                        if n == 0:
+                            thumb = _write_thumbnail(out_dir, frame)
+                            if thumb is not None:
+                                say(type="thumbnail", path=str(thumb))
                         frames_out.append(
                             {
                                 "i": n,
@@ -642,46 +682,166 @@ def run_analysis(job, out, stop_event):
 # -------------------------------------------------------------------- parent
 
 
-class AnalysisJobs:
-    """Every Analyze job, and the one child process that runs them.
+TERMINAL = ("done", "error", "cancelled")
 
-    In memory on purpose. A job is a question somebody asked about a file, not a
-    record of anything the app observed, and it has no place in the frozen
-    schema. A restart loses them, which is why the directory is swept on start.
+# In memory a stopped run is `cancelled`; the table's frozen vocabulary has four
+# values and that is not one of them, so it is stored as `error` carrying the
+# reason. The two agree about everything except the word, and the word only
+# differs for as long as this process is up.
+_DB_STATUS = {"running": "processing", "cancelled": "error"}
+
+
+def _media_url(stored):
+    """A stored file path as the URL the browser fetches it from."""
+    path = run_store.full_path(stored)
+    if path is None:
+        return None
+    try:
+        tail = path.resolve().relative_to(config.analyze_dir().resolve()).as_posix()
+    except (ValueError, OSError):
+        return None
+    return f"{MEDIA_PREFIX}/{tail}"
+
+
+class AnalysisJobs:
+    """Every Analyze run: its row, its files, and the one child process.
+
+    Since P6 a run outlives the request that started it and the process that ran
+    it. The row in `analyze_runs` is the record -- what was analysed, how it
+    went, and where the saved result document and thumbnail are -- and the job
+    directory holds the annotated frames, the crops and that document. Neither
+    is a sighting and nothing here writes one.
+
+    **This class never opens a write connection.** It is handed the same
+    `write(fn)` the API routes use, which runs on the pipeline's single writer
+    thread. One writer, always.
+
+    Still one child process at a time. The card is 6 GB and has to hold three
+    streams; a fourth model set loaded because two files were dropped in a row is
+    how that budget is spent twice. What P6 changes is that the second file is
+    now a run of its own from the moment it is submitted -- queued, listed, with
+    its own progress bar and its own delete -- rather than something the screen
+    forgot while it waited.
     """
 
-    def __init__(self):
+    def __init__(self, write=None):
         self.ctx = mp.get_context("spawn")
+        # Runs this process has touched, by run id as text. The table is the
+        # record; this holds what is known beyond it -- the uri, the stage, the
+        # live progress -- none of which is one of the frozen columns.
         self.jobs = {}
-        self.order = deque()
         self.pending = deque()
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.thread = None
         self.stopping = False
-        self.current = None        # job_id of the running child
+        self.current = None        # run id of the running child
         self.stop_event = None     # its stop event
+        self.write = write
 
     # ------------------------------------------------------------- lifecycle
 
+    def bind_writer(self, write):
+        """Take the one writer. Called by create_app before anything runs."""
+        self.write = write
+
+    def _write(self, fn):
+        if self.write is not None:
+            return self.write(fn)
+        return run_store.write_directly(fn)
+
+    def keep(self):
+        try:
+            return max(1, int(config.default("analyze_keep", DEFAULT_KEEP)))
+        except (TypeError, ValueError):
+            return DEFAULT_KEEP
+
     def start(self, sweep=True):
-        # What is left over is listed here and deleted on a thread of its own.
-        # `start` runs inside the FastAPI lifespan, and a delete on Windows can
-        # block forever rather than fail -- one wedged crop file left by a
-        # killed run is enough -- which stops the whole app at "Waiting for
-        # application startup". Listing first keeps the meaning of the sweep
-        # unchanged: only directories that existed before this run are ever
-        # removed, so a job submitted a moment later cannot be swept out from
-        # under itself.
+        """Reconcile what a previous process left, then take work.
+
+        Two different leftovers, and they are not the same problem:
+
+        - a row still `queued` or `processing` is a run whose process is gone.
+          It is failed with the reason and KEPT, because the user deletes runs,
+          not the app -- and its half-written frames are swept, because there is
+          no result to view them from.
+        - a directory with no row is an orphan: either the run was deleted and
+          its files would not go, or the database was replaced. Nothing can open
+          it again, so it goes.
+
+        Both deletions happen on a thread of their own. `start` runs inside the
+        FastAPI lifespan and a delete on Windows can block rather than fail --
+        one wedged file is enough -- which would stop the whole app at "Waiting
+        for application startup". Listing first also keeps the sweep's meaning:
+        only what existed before this run is ever removed, so a run submitted a
+        moment later cannot be swept out from under itself.
+        """
+        interrupted = []
+        try:
+            interrupted = self._write(run_store.mark_interrupted)
+        except Exception as exc:  # noqa: BLE001 - a sweep must not stop the app
+            print(f"[analyze] could not reconcile past runs: "
+                  f"{type(exc).__name__}: {exc}")
+        for row in interrupted:
+            print(f"[analyze] run {row['run_id']} ({row['original_filename']}) was "
+                  f"{row['status']} when the app stopped -- marked error")
+
+        sweep = sweep and self._owns_directory()
         stale = self._stale_dirs() if sweep else []
+        partial = (
+            [config.analyze_dir() / str(row["run_id"]) for row in interrupted]
+            if sweep else []
+        )
         self.thread = threading.Thread(
             target=self._run_loop, name="analyze", daemon=True
         )
         self.thread.start()
-        if stale:
+        if stale or partial:
             threading.Thread(
-                target=self._sweep, args=(stale,), name="analyze-sweep", daemon=True
+                target=self._sweep, args=(stale, partial), name="analyze-sweep",
+                daemon=True,
             ).start()
+
+    def _owner_path(self):
+        return config.analyze_dir() / ".belongs-to"
+
+    def _owns_directory(self, quiet=False):
+        """Whether this database is the one these job directories belong to.
+
+        A run directory belongs to a row, and every row lives in one database.
+        Point the app at a DIFFERENT database -- which every verification suite
+        in scratch/ does, and which anyone moving `paths.db` does -- and every
+        directory here looks orphaned, because the rows naming them are in the
+        file left behind. Sweeping on that reading would delete the real runs of
+        the real database, and it would do it at startup, before anybody could
+        object.
+
+        So the directory records which database it was swept for, once, and a
+        mismatch turns the sweep off and says why rather than guessing. Nothing
+        else is affected: runs still start, list, open and delete.
+        """
+        marker = self._owner_path()
+        try:
+            owner = str(config.db_path().resolve())
+        except OSError:
+            return False
+        try:
+            if marker.exists():
+                written = marker.read_text(encoding="utf-8").strip()
+                if written and written != owner:
+                    if not quiet:
+                        print(f"[analyze] {config.analyze_dir()} belongs to {written}, "
+                              f"not to {owner} -- leaving every directory in it alone.")
+                    return False
+                if written == owner:
+                    return True
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(owner + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"[analyze] could not read or write {marker}: {exc} -- "
+                  f"leaving every directory alone.")
+            return False
+        return True
 
     def _attempted_path(self):
         return config.analyze_dir() / ".sweep-attempted"
@@ -701,14 +861,18 @@ class AnalysisJobs:
         try:
             if names:
                 with path.open("w", encoding="utf-8") as f:
-                    f.write('\n'.join(names) + '\n')
+                    f.write("\n".join(names) + "\n")
             elif path.exists():
                 path.unlink()
         except OSError:
             pass
 
     def _stale_dirs(self):
-        """The job directories a previous run left, minus the ones that will not go.
+        """The orphaned job directories, minus the ones that will not go.
+
+        A directory belongs to a run for as long as its row exists -- which is
+        what P6 changed, and why this no longer removes everything it finds. An
+        orphan is a directory no row names.
 
         A delete that hangs cannot report that it hung -- the call never
         returns -- so the name is written down before the attempt rather than
@@ -720,22 +884,30 @@ class AnalysisJobs:
         root = config.analyze_dir()
         if not root.exists():
             return []
-        dirs = [path for path in root.iterdir() if path.is_dir()]
+        # Asked here as well as in `start`, so that nothing can arrive at this
+        # list by another route: a directory is only ever orphaned relative to
+        # the database that owns it. `start` has already said so out loud.
+        if not self._owns_directory(quiet=True):
+            return []
+        try:
+            known = run_store.read_ids()
+        except Exception as exc:  # noqa: BLE001 - never sweep on a guess
+            print(f"[analyze] could not read the run list, so nothing is swept: "
+                  f"{type(exc).__name__}: {exc}")
+            return []
+        dirs = [
+            path for path in root.iterdir()
+            if path.is_dir() and path.name not in known
+        ]
         attempted = set(self._read_attempted())
-        skipped = [p for p in dirs if p.name in attempted]
-        for path in skipped:
+        for path in [p for p in dirs if p.name in attempted]:
             print(f"[analyze] leaving {path} alone -- a previous run could not delete "
                   f"it. Nothing here reads it; delete it by hand when the machine "
                   f"lets go of it.")
         return [p for p in dirs if p.name not in attempted]
 
-    def _sweep(self, stale):
-        """Remove job directories left by a previous run.
-
-        Jobs live in memory, so after a restart every directory under here is
-        orphaned: there is no job to open it from and nothing will ever delete
-        it. Sweeping is the only thing that keeps this from growing forever.
-        """
+    def _sweep(self, stale, partial=()):
+        """Remove orphaned directories, and the half-written files of failed runs."""
         attempted = self._read_attempted()
         self._write_attempted(attempted + [p.name for p in stale])
         removed = []
@@ -749,8 +921,15 @@ class AnalysisJobs:
         if removed:
             still = [n for n in self._read_attempted() if n not in removed]
             self._write_attempted(still)
-            print(f"[analyze] swept {len(removed)} job "
-                  f"director{'y' if len(removed) == 1 else 'ies'} left by a previous run")
+            print(f"[analyze] swept {len(removed)} orphaned job "
+                  f"director{'y' if len(removed) == 1 else 'ies'}")
+
+        # An interrupted run keeps its row and its thumbnail -- enough to see
+        # what it was and to delete it -- and loses the frames and crops of a
+        # result that will never exist.
+        for path in partial:
+            for name in ("frames", "crops", "plates"):
+                shutil.rmtree(path / name, ignore_errors=True)
 
     def shutdown(self):
         self.stopping = True
@@ -763,7 +942,13 @@ class AnalysisJobs:
     # ---------------------------------------------------------------- public
 
     def submit(self, uri, frame_skip=None, name=None):
-        """Queue one file for analysis and return its job."""
+        """Queue one file for analysis and return its run.
+
+        The row is written before anything else happens, because the row is what
+        makes the run exist: the id it comes back with names the directory, the
+        media URLs and the route, so there is no moment at which a run is
+        running and not recorded.
+        """
         text = str(uri or "").strip()
         if not text:
             return None, "Choose a file to analyze, or upload one."
@@ -777,11 +962,26 @@ class AnalysisJobs:
         if not path.exists():
             return None, f"There is no file at {text}."
 
-        job_id = uuid.uuid4().hex[:12]
+        label = name or path.name
+        try:
+            row = self._write(
+                lambda conn: run_store.insert(
+                    conn, kind=kind, original_filename=label, progress=0.0
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - the reason has to reach the UI
+            traceback.print_exc()
+            return None, (
+                f"The run could not be recorded: {type(exc).__name__}: {exc}. "
+                f"Check the server log."
+            )
+
+        job_id = str(row["run_id"])
         job = {
             "job_id": job_id,
+            "run_id": row["run_id"],
             "uri": text,
-            "name": name or path.name,
+            "name": label,
             "kind": kind,
             "frame_skip": int(frame_skip or config.default("frame_skip", 3)),
             "status": "queued",
@@ -792,44 +992,95 @@ class AnalysisJobs:
             "warning": None,
             "counts": None,
             "media": None,
-            "created_ts": time.time(),
+            "thumbnail": None,
+            "created_ts": row["created_ts"],
             "started_ts": None,
             "finished_ts": None,
             "queue_position": None,
         }
         with self.lock:
             self.jobs[job_id] = job
-            self.order.append(job_id)
             self.pending.append(job_id)
-            self._evict()
         self.wake.set()
+        self._evict()
         return self.view(job_id), None
 
-    def view(self, job_id):
-        """One job as the API returns it, with its queue position filled in."""
-        with self.lock:
-            job = self.jobs.get(job_id)
-            if job is None:
-                return None
-            snapshot = dict(job)
-            if job["status"] == "queued":
-                try:
-                    snapshot["queue_position"] = list(self.pending).index(job_id) + 1
-                except ValueError:
-                    snapshot["queue_position"] = None
+    def _live(self, job_id):
+        """The in-memory job, with its queue position filled in. Caller holds."""
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        snapshot = dict(job)
+        if job["status"] == "queued":
+            try:
+                snapshot["queue_position"] = list(self.pending).index(job_id) + 1
+            except ValueError:
+                snapshot["queue_position"] = None
         return snapshot
 
-    def list(self, limit=25):
+    def _from_row(self, row):
+        """A stored run in the shape a live one has.
+
+        A run from a previous session has no uri, no stage and no counts -- none
+        of them are columns, and inventing them would be inventing them. What it
+        has is what it was, how it ended, and where its result is.
+        """
+        return {
+            "job_id": str(row["run_id"]),
+            "run_id": row["run_id"],
+            "uri": None,
+            "name": row["original_filename"],
+            "kind": row["kind"],
+            "frame_skip": None,
+            "status": row["status"],
+            "stage": None,
+            "detail": None,
+            "progress": row["progress"],
+            "error": row["error"],
+            "warning": None,
+            "counts": None,
+            "media": None,
+            "thumbnail": _media_url(row["thumbnail_path"]),
+            "created_ts": row["created_ts"],
+            "started_ts": None,
+            "finished_ts": None,
+            "queue_position": None,
+        }
+
+    def view(self, job_id):
+        """One run as the API returns it: live state over stored state."""
         with self.lock:
-            ids = list(self.order)[-limit:][::-1]
-        return [v for v in (self.view(i) for i in ids) if v is not None]
+            live = self._live(str(job_id))
+        if live is not None:
+            return live
+        row = run_store.read_one(job_id)
+        return None if row is None else self._from_row(row)
+
+    def list(self, limit=25):
+        """The runs, newest first, for the list beside the result."""
+        rows = run_store.read_recent(limit)
+        out = []
+        with self.lock:
+            for row in rows:
+                live = self._live(str(row["run_id"]))
+                if live is None:
+                    out.append(self._from_row(row))
+                    continue
+                # The row carries the thumbnail, the live job carries everything
+                # that moves. Neither is complete on its own.
+                if not live.get("thumbnail"):
+                    live["thumbnail"] = _media_url(row["thumbnail_path"])
+                out.append(live)
+        return out
 
     def result(self, job_id):
-        """The result document, or None if the job has not produced one."""
-        job = self.view(job_id)
-        if job is None or job["status"] != "done":
+        """The result document, or None if this run has not produced one."""
+        row = run_store.read_one(job_id)
+        if row is None:
             return None
-        path = config.analyze_dir() / job_id / "result.json"
+        path = run_store.full_path(row["result_path"])
+        if path is None:
+            path = config.analyze_dir() / str(row["run_id"]) / "result.json"
         if not path.exists():
             return None
         try:
@@ -838,52 +1089,122 @@ class AnalysisJobs:
             return None
 
     def cancel(self, job_id):
+        job_id = str(job_id)
+        queued = running = False
         with self.lock:
             job = self.jobs.get(job_id)
             if job is None:
-                return False, "That job no longer exists."
-            if job["status"] in ("done", "error", "cancelled"):
-                return False, f"That job has already finished ({job['status']})."
-            if job_id in self.pending:
+                row = run_store.read_one(job_id)
+                if row is None:
+                    return False, "That run no longer exists."
+                return False, f"That run has already finished ({row['status']})."
+            if job["status"] in TERMINAL:
+                return False, f"That run has already finished ({job['status']})."
+            queued = job_id in self.pending
+            if queued:
                 self.pending.remove(job_id)
                 job.update(status="cancelled", finished_ts=time.time(),
                            stage=None, detail=None)
-                return True, None
             running = self.current == job_id
+        if queued:
+            self._persist(job_id, status="cancelled")
+            return True, None
         if running and self.stop_event is not None:
             self.stop_event.set()
             return True, None
-        return False, "That job could not be stopped."
+        return False, "That run could not be stopped."
 
     def delete(self, job_id):
-        self.cancel(job_id)
+        """Stop the run if it is still going, then remove its row and its files.
+
+        In that order, and the wait between them is not optional: on Windows a
+        video file held by a process that has not exited cannot be deleted, and
+        neither can the frames it is still writing. `_run_one` only marks a run
+        terminal after the child has been joined, so waiting for that is waiting
+        for every handle to be closed.
+        """
+        job_id = str(job_id)
         with self.lock:
-            job = self.jobs.pop(job_id, None)
-            if job_id in self.order:
-                self.order.remove(job_id)
+            known = job_id in self.jobs
+        if run_store.read_one(job_id) is None and not known:
+            return False
+
+        self.cancel(job_id)
+        if not self._await_finished(job_id, CANCEL_GRACE_SEC + 10):
+            print(f"[analyze] run {job_id} did not stop in time; its files are "
+                  f"left for the next startup sweep")
+
+        with self.lock:
+            self.jobs.pop(job_id, None)
             if job_id in self.pending:
                 self.pending.remove(job_id)
-        if job is None:
-            return False
-        shutil.rmtree(config.analyze_dir() / job_id, ignore_errors=True)
+        self._write(lambda conn: run_store.remove(conn, job_id))
+
+        directory = config.analyze_dir() / job_id
+        shutil.rmtree(directory, ignore_errors=True)
+        if directory.exists():
+            print(f"[analyze] removed run {job_id} but could not delete "
+                  f"{directory} -- it is swept on the next start.")
         return True
 
     # --------------------------------------------------------------- internal
 
-    def _evict(self):
-        """Drop the oldest finished jobs once there are too many. Caller holds."""
-        while len(self.order) > MAX_JOBS:
-            for job_id in list(self.order):
+    def _await_finished(self, job_id, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            with self.lock:
                 job = self.jobs.get(job_id)
-                if job and job["status"] in ("done", "error", "cancelled"):
-                    self.order.remove(job_id)
-                    self.jobs.pop(job_id, None)
-                    shutil.rmtree(
-                        config.analyze_dir() / job_id, ignore_errors=True
-                    )
-                    break
-            else:
-                return
+                if job is None or job["status"] in TERMINAL:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+
+    def _persist(self, job_id, **fields):
+        """Write what changed onto this run's row, and onto nothing else."""
+        status = fields.pop("status", None)
+        payload = dict(fields)
+        if status is not None:
+            payload["status"] = _DB_STATUS.get(status, status)
+            # Not setdefault: the caller passes `error=None` for a run that
+            # stopped without failing, and a row saying `error` with nothing in
+            # its error column is a run that cannot explain itself after a
+            # restart.
+            if status == "cancelled" and not payload.get("error"):
+                payload["error"] = run_store.CANCELLED_ERROR
+        if not payload:
+            return None
+        try:
+            return self._write(
+                lambda conn: run_store.update(conn, job_id, **payload)
+            )
+        except Exception as exc:  # noqa: BLE001 - a run must not die of its record
+            print(f"[analyze] could not update run {job_id}: "
+                  f"{type(exc).__name__}: {exc}")
+            return None
+
+    def _evict(self):
+        """Drop the oldest finished runs past the cap, with their directories."""
+        with self.lock:
+            protect = [
+                int(j["run_id"]) for j in self.jobs.values()
+                if j["status"] not in TERMINAL
+            ]
+        try:
+            doomed = self._write(
+                lambda conn: run_store.evict(conn, self.keep(), protect=protect)
+            )
+        except Exception as exc:  # noqa: BLE001 - the cap is housekeeping, not the run
+            print(f"[analyze] could not evict old runs: {type(exc).__name__}: {exc}")
+            return
+        for row in doomed:
+            job_id = str(row["run_id"])
+            with self.lock:
+                self.jobs.pop(job_id, None)
+            shutil.rmtree(config.analyze_dir() / job_id, ignore_errors=True)
+        if doomed:
+            print(f"[analyze] evicted {len(doomed)} run(s) past the analyze_keep "
+                  f"cap of {self.keep()}")
 
     def _run_loop(self):
         while not self.stopping:
@@ -906,6 +1227,7 @@ class AnalysisJobs:
                         status="error", finished_ts=time.time(),
                         error=f"{type(exc).__name__}: {exc}",
                     )
+                self._persist(job_id, status="error", error=job["error"])
 
     def _run_one(self, job):
         job_id = job["job_id"]
@@ -929,10 +1251,12 @@ class AnalysisJobs:
             self.stop_event = stop_event
             job.update(status="running", started_ts=time.time(), stage="starting",
                        detail="Starting", queue_position=None)
+        self._persist(job_id, status="running", progress=0.0)
         process.start()
         print(f"[analyze {job_id}] {job['kind']} {job['uri']} (pid {process.pid})")
 
         terminal = None
+        last_persist = time.monotonic()
         try:
             while True:
                 try:
@@ -942,6 +1266,7 @@ class AnalysisJobs:
                         break
                     continue
                 kind = message.get("type")
+                thumbnail = None
                 with self.lock:
                     if kind == "stage":
                         job["stage"] = message.get("stage")
@@ -950,6 +1275,9 @@ class AnalysisJobs:
                             job["media"] = message["media"]
                     elif kind == "progress":
                         job["progress"] = message.get("progress", job["progress"])
+                    elif kind == "thumbnail":
+                        thumbnail = run_store.store_path(message.get("path"))
+                        job["thumbnail"] = _media_url(thumbnail)
                     elif kind == "done":
                         terminal = "done"
                         job["counts"] = message.get("counts")
@@ -960,8 +1288,16 @@ class AnalysisJobs:
                         job["error"] = message.get("error")
                     elif kind == "cancelled":
                         terminal = "cancelled"
+                if thumbnail is not None:
+                    self._persist(job_id, thumbnail_path=thumbnail)
                 if terminal is not None:
                     break
+                now = time.monotonic()
+                if kind == "progress" and now - last_persist >= PERSIST_EVERY_SEC:
+                    last_persist = now
+                    with self.lock:
+                        seen = job["progress"]
+                    self._persist(job_id, progress=seen)
         finally:
             if terminal is None and process.is_alive():
                 # Nothing terminal arrived, so either it is being cancelled or
@@ -989,11 +1325,25 @@ class AnalysisJobs:
             job["finished_ts"] = time.time()
             job["stage"] = None
             job["detail"] = None
+            error = job["error"]
+            progress = 1.0 if terminal == "done" else job["progress"]
+
+        # The row is finished last, and only after the child has been joined, so
+        # a row that reads `done` is one whose result document is on disk and
+        # whose file handles are closed.
+        result_path = None
         if terminal == "done":
             document = self.result(job_id)
             if document is not None:
                 with self.lock:
                     job["warning"] = document.get("warning")
+                result_path = run_store.store_path(
+                    config.analyze_dir() / job_id / "result.json"
+                )
+        self._persist(
+            job_id, status=terminal, progress=progress, error=error,
+            result_path=result_path,
+        )
 
 
 # --------------------------------------------------------------------- export

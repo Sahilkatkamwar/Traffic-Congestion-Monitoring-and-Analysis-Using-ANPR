@@ -2723,3 +2723,244 @@ anything.
   verified through the built bundle and the HTTP routes rather than through a
   screenshot.
 
+---
+
+# P6 - Analyze: persisted, multi-session, deletable
+
+First phase of PHASE2.md. P0-P5 were not re-opened: `app/detect.py`, `app/ocr.py`,
+`app/grammar.py`, `app/matching.py`, `app/stitch.py`, `app/worker.py` and every
+model weight are byte-identical, and no P0-P5 table gained a column.
+
+## The problem, stated as it actually was
+
+An Analyze result existed only in the response that carried it. Navigate away
+and it was gone; the job directory holding its annotated frames, its crops and
+its `result.json` was swept at the next startup, because nothing could ever open
+it again. Submitting a second file replaced the first on the screen. The engine
+was already good -- the same detector, tracker, stitcher and plate reader a
+source worker runs -- and everything it produced was thrown away.
+
+## What was built
+
+**`analyze_runs`, the frozen nine columns of PHASE2.md**, added to `app/db.py`
+with an index on `created_ts`. `run_id` is the identity everywhere: it names the
+job directory, the media URLs under `/media/analyze/<run_id>/`, and the route
+`/api/analyze/<run_id>`. The route still answers to the same `job_id` key it
+always did, which is why `p4c_verify` needed no change to keep passing.
+
+**`app/runs.py`, new -- the table's statements and nothing else.** Every write
+function takes a connection it did not open, so it runs on the pipeline's single
+writer thread like every other write in the app; the read functions open a read
+connection, which WAL takes any number of. `create_app` hands `AnalysisJobs` the
+same `write(fn)` the routes use, so the job runner still knows nothing about
+cameras, pipelines or SQLite -- it is handed a function.
+
+**`AnalysisJobs` rewritten around the row.** The row is written before anything
+else happens: the id it comes back with is what names the directory, so there is
+no moment at which a run is running and not recorded. Live state -- the uri, the
+stage, the moving progress -- stays in memory, because none of it is a column;
+`view()` and `list()` return live state over stored state, in one shape, so the
+screen never has to know which it is looking at.
+
+**The screen is a rail and a result.** `web/src/components/RunRail.jsx` lists
+every run newest-first with its thumbnail, filename, kind, time and status --
+several can be in flight and each has its own bar -- and `AnalyzeScreen` polls
+the list quickly while anything is running and every 5s when nothing is.
+Selecting a finished run reads its saved `result.json` back; nothing re-runs.
+
+**A thumbnail, written by the child.** From the FIRST annotated frame rather
+than a representative one: the list has to show something the moment a long
+video starts, and "representative" cannot be known until the run is over.
+
+## The five decisions, and what each refuses
+
+**One child process at a time, still.** PHASE2.md asks for several runs
+mid-processing, each with its own progress bar, and that is what the rail shows;
+what it does not do is load a fourth set of models onto a 6 GB card that has to
+hold three streams. A queued run is a run -- listed, recorded, with its position
+shown -- rather than something the screen forgets while it waits. Asked and
+confirmed before the code was written.
+
+**`cancelled` is not a fifth status.** The contract freezes four -- `queued`,
+`processing`, `done`, `error` -- so a run the user stopped is stored as `error`
+carrying the reason ("Stopped before it finished..."). The running process keeps
+the finer word in memory, so the screen says "Stopped" for as long as the app is
+up and says `error` with that sentence afterwards. The alternative was inventing
+a value the frozen list does not have.
+
+**An interrupted run keeps its row.** A `queued` or `processing` row at startup
+can only mean the process that owned it is gone, so it is failed with a sentence
+saying so and kept -- the user deletes runs, not the app. Its half-written frames
+and crops go, because there is no result to view them from; its thumbnail stays,
+so the row is recognisable in the rail.
+
+**Delete stops first and waits.** `cancel`, then wait for the run to reach a
+terminal state -- which `_run_one` only sets after the child has been joined --
+and only then remove the row and the directory. On Windows a video file held by
+a process that has not exited cannot be deleted, and neither can the frames it
+is still writing. Measured: deleting a running video analysis returned in 2.1s
+and the video file itself could then be deleted, which is the proof no handle
+was left open.
+
+**`analyze_keep: 50`, in settings.yaml.** A run now survives the app closing, so
+something has to bound it: past the cap the oldest FINISHED run goes with its
+files. A queued or running run is never evicted, and a run the user has not
+deleted goes only to this cap.
+
+## The guard that came out of the work, and why it is there
+
+The sweep used to delete every job directory it found, because after a restart
+none of them could be opened. Now a directory belongs to a row -- so the sweep
+deletes only directories no row names, which is right until somebody points the
+app at a different database. Every verification suite in `scratch/` does exactly
+that: a throwaway `paths.db` and, in most of them, the real `data/analyze`. On
+that reading every real run looks orphaned, and the suite would delete the user's
+runs at startup before anybody could object.
+
+So `data/analyze/.belongs-to` records which database the directory was swept
+for. A mismatch turns the sweep off and prints why; it never guesses. Runs still
+start, list, open and delete under a mismatch -- only the sweep stops.
+`p4c_verify` and `p6_verify` also point `paths.analyze` at their own temp
+directory, which is the belt to that braces.
+
+## Exit criteria - verified
+
+> *upload two different files back-to-back without navigating away; both remain
+> selectable and viewable independently; deleting one leaves the other's files
+> and DB rows untouched.*
+
+`scratch/p6_verify.py`, over HTTP against the real app with **no pipeline and no
+sources** -- the zero-camera condition itself, not a simulation of it -- and
+then against a **second server process on the same database**, because
+"persisted" and "multi-session" cannot be shown by one process that never let go.
+
+    A  surface      validation, the list's shape, the messages a person sees
+    B  exit         two files back-to-back: both listed, both progressing on
+                    their own, both done, both viewable independently
+    C  row          the frozen nine columns, and what is in them
+    D  reload       the saved result is read back -- result.json is not rewritten
+                    and no new frame is produced
+    E  delete       one run removed; the other's row, files and result untouched
+    F  stop         a stopped run keeps its row and says it was stopped
+    F2 delete-live  deleting a processing run stops it and releases the file
+    G  isolation    no sighting, no source, no alert; the deep link still serves
+    H  restart      a second process: the run is still there and still opens; an
+                    interrupted run is failed with its reason, its frames swept,
+                    its thumbnail kept; an orphaned directory is removed
+    I  cap          analyze_keep evicts the oldest FINISHED run, never a live one
+    J  ownership    a directory is only swept for the database it belongs to
+
+`scratch/p6_verify.py` -- **114 passed, 0 failed, 0 skipped in 22s.**
+
+The exit criterion itself, in the run's own words: two stills uploaded
+back-to-back are accepted as two runs with two ids; while the first is being
+read the list carries both, one `running` with a moving progress and one
+`queued` saying it is second; both finish; each result names its own file;
+selecting the first again returns a byte-identical document and neither
+rewrites `result.json` nor produces a new frame. Deleting the first answers 204,
+its row and directory go, and **the other run's row, files and result are
+untouched** -- checked by comparing the directory listing before and after.
+
+Deleting a run that is still processing returned in **2.1s**, and the video file
+it was reading could then be deleted from disk, which is the only real proof on
+Windows that no handle was left open.
+
+## Regression -- the documented failures, and nothing new
+
+Every suite re-run against the P6 tree. The heavy ones were run on a quiet
+machine: three processes from an earlier session (two `python -m app.run` and a
+leftover `os.lstat` probe loop) had each burned 5.5 CPU-hours and were still
+spinning, and they were stopped first, with the user's agreement.
+
+    p1_verify              21/22   the documented environmental webcam failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision  14/14   run earlier in this session; see the note below
+    p2_verify              33/34   the documented ocr_tworow500 calibration failure
+    p3_verify              57/57
+    p4a_verify             25/25
+    p4b_verify             67/72   five environmental failures, reproduced on the pre-P6 tree
+    p4c_verify             75/75   unchanged, and one check rewritten -- below
+    p4d_verify             79/81   the documented application-database failures
+    p4e_verify            128/129  the same
+    p5_verify            109/109
+    p5_notify_verify     181/183   pre-existing, and not this phase -- below
+    p5_number_live         14/15   the same cause
+    p6_verify            114/114   new
+
+**`p5_notify_verify` and `p5_number_live` fail on the same pre-existing thing,
+which P6 did not cause and did not fix.** Both save `+919960089069` over HTTP
+and then assert that exactly one line of settings.yaml changed. The shipped
+`config/settings.yaml` already carries that number -- it is in `HEAD` -- so the
+save is a no-op and zero lines change. Nothing in this phase touches
+`notify.police_number`; the addition to that file is `analyze_keep`, eleven
+lines in the `defaults:` block. PROGRESS.md's earlier 158/158 and 15/15 were
+measured before the number was committed to the file, and the suites have grown
+since (183 checks now, not 158). Left failing rather than adjusted: editing a
+verification script to admit a result is how a regression gets shipped.
+
+**One check in `p4c_verify` was rewritten, and it is worth saying which.** It
+asserted that `app/analyze.py` "contains no SQL at all, and never imports the
+database module". P6 is what changed the second half -- an Analyze run is now a
+row -- so what the check is *for* was restated rather than dropped: analyze.py
+still contains no SQL, and the only table reachable through `app/runs.py` is
+`analyze_runs`. `p6_verify` section G asserts the same two things independently,
+alongside the count that no sighting was written.
+
+`p4c_verify` and `p6_verify` also point `paths.analyze` at their own temp
+directory. That is a fix, not a preference: see the ownership guard above.
+
+## Files
+
+    app/db.py                          analyze_runs, and its index
+    app/runs.py                        NEW -- the table's statements, nothing else
+    app/analyze.py                     AnalysisJobs rewritten around the row;
+                                       thumbnail written by the child
+    app/api.py                         jobs.bind_writer(write); the lifespan order;
+                                       the analyze routes' wording
+    config/settings.yaml               analyze_keep: 50
+    web/src/components/RunRail.jsx     NEW -- the run list
+    web/src/screens/AnalyzeScreen.jsx  rail + result, two polls, delete confirm
+    scratch/p6_verify.py               NEW -- 114 checks
+    scratch/p4c_verify.py              one check rewritten, paths.analyze redirected
+
+`web/dist` rebuilt.
+
+## Runnable
+
+    env\Scripts\activate.bat
+    python -m app.run
+
+Then http://127.0.0.1:8000/analyze. Drop a file, drop another before the first
+finishes, leave the screen, come back, restart the app -- both runs are still in
+the rail and both still open.
+
+## What is not done, and is not pretended to be
+
+- **Two analyses still do not run at the same time.** One child process, by
+  decision and for the card's sake; several runs are *tracked* at once, each
+  with its own bar. If that is wanted later it is a worker pool in
+  `AnalysisJobs` and nothing else has to move.
+- **A run from a previous session has no uri.** `analyze_runs` has no column for
+  one and this phase did not add fields to a frozen table, so an old run cannot
+  be re-run from the rail with one click -- the file is chosen again. Asking for
+  that column is the fix, and it needs asking.
+- **`cancelled` reads as `error` after a restart**, carrying the sentence that
+  says it was stopped. That is the frozen four-value vocabulary being honoured
+  rather than a limitation of the code.
+- **No browser rendered the rail in this pass.** There is no headless browser in
+  `web/node_modules` and adding one is forbidden, so the screen is verified
+  through the built bundle and the HTTP routes, as every phase before it was.
+- **`p4b_verify`'s five failures are environmental and were reproduced on the
+  pre-P6 tree**, byte for byte, by stashing this phase's four changed files and
+  running it again: 67 passed, 5 failed, 448s, the same five checks and the same
+  0.568 progress. All five are the same fact -- the recorded-video worker does
+  not reach the end of `23sec.mp4` inside the suite's window on this machine
+  today, so the source is still `running` when the checks after it are made.
+- **`p1_verify_supervision` was measured before the last two edits of this
+  phase, not after.** It passed 14/14 against the P6 rewrite; the ownership
+  guard and the cancelled-error fix landed after that, and the re-run could not
+  be made: three processes from an earlier session are unkillable on this
+  machine (taskkill reports no such task while their CPU counters keep rising)
+  and they hold files under `scratch/` open, so the suite cannot even be read
+  from disk. It wants a reboot and one re-run, and that is the honest state of
+  it rather than a number.

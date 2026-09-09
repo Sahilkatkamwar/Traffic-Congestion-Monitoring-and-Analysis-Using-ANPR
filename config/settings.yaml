@@ -440,6 +440,17 @@ defaults:
   analyze_max_frames: 600
   analyze_frame_width: 720
 
+  # How many Analyze runs are kept (P6). A run is a row in `analyze_runs` plus a
+  # directory of annotated frames and crops, and it now survives the app being
+  # closed, so something has to bound it: past this the OLDEST FINISHED run is
+  # removed with its files. A run that is queued or still processing is never
+  # evicted, and a run the user has not deleted goes only to this cap.
+  #
+  # 50 because the frames of a 200s clip are about 35 MB, so fifty of the
+  # longest thing this screen is given stays under 2 GB, while a day of
+  # demonstrating it does not come close. Tune it here, never in the code.
+  analyze_keep: 50
+
   # --- alerts (P5) ----------------------------------------------------------
   # How close a stored read has to be to a plate before the two are treated as
   # the same vehicle. This is a confusion-weighted EDIT COST, not a similarity

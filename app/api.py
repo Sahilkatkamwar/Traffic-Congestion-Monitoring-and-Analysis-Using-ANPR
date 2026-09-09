@@ -122,10 +122,14 @@ def create_app(pipeline=None):
         # Bind before the workers start, or the first sightings are published
         # into a hub that has no loop to schedule them on.
         hub.bind_loop(asyncio.get_running_loop())
-        jobs.start()
+        # The pipeline first, and Analyze after it: since P6 `jobs.start()`
+        # writes -- it fails the runs a previous process left mid-flight -- and
+        # that write goes through the pipeline's writer thread, which does not
+        # exist until `pipeline.start()` has run.
         if pipeline is not None:
             pipeline.on_event = hub.publish
             pipeline.start()
+        jobs.start()
         yield
         if pipeline is not None:
             pipeline.shutdown()
@@ -414,6 +418,11 @@ def create_app(pipeline=None):
             return fn(conn)
         finally:
             conn.close()
+
+    # Analyze keeps its runs in `analyze_runs`, and it writes them the way every
+    # other route does: through the one writer. It is handed the function rather
+    # than the pipeline so it still has no idea whether a camera exists.
+    jobs.bind_writer(write)
 
     def read_source(conn, source_id):
         row = conn.execute(
@@ -880,15 +889,23 @@ def create_app(pipeline=None):
         return job
 
     @app.get("/api/analyze")
-    def list_analyses(limit: int = Query(25, ge=1, le=100)):
+    def list_analyses(limit: int = Query(50, ge=1, le=100)):
+        """Every run, newest first -- the list the screen is chosen from.
+
+        Runs of this session carry their live progress and stage; runs from a
+        previous one carry what the table holds. Both are the same shape, so the
+        list does not have to know which it is looking at.
+        """
         return jobs.list(limit)
 
     @app.get("/api/analyze/{job_id}")
     def get_analysis(job_id: str):
-        """One job, carrying its full result once it has one.
+        """One run, carrying its full result once it has one.
 
-        The result is only attached when the job is done, so a client polling a
-        running job gets the small document every time and the large one once.
+        The result is read back off disk, so selecting a run finished days ago
+        shows its boxes, reads and crops without running a model again. A run
+        still going carries no result yet, which is why a client polling one
+        gets the small document every time and the large one once.
         """
         job = jobs.view(job_id)
         if job is None:
@@ -905,8 +922,14 @@ def create_app(pipeline=None):
 
     @app.delete("/api/analyze/{job_id}", status_code=204)
     def delete_analysis(job_id: str):
+        """Remove one run: its row, its crops and frames, and its saved result.
+
+        A run still processing is stopped first and waited for. Deleting the
+        files under a child that still holds them is the Windows dead-handle
+        trap, and it would leave a directory nothing can ever remove.
+        """
         if not jobs.delete(job_id):
-            return fail(404, f"There is no analysis job {job_id}.")
+            return fail(404, f"There is no analysis run {job_id}.")
         return Response(status_code=204)
 
     @app.get("/api/analyze/{job_id}/export.{fmt}")

@@ -70,10 +70,35 @@ CREATE TABLE IF NOT EXISTS alerts (
     created_ts   TEXT
 );
 
+-- P6. One row per Analyze run, so a result outlives the response that
+-- produced it and the screen can be left and come back to.
+--
+-- Deliberately NOT a sighting and never joined to one: an analysis is what the
+-- models say about a file, and a sighting is a vehicle a placed camera saw at a
+-- real time. What is kept here is the run -- what was analysed, how it went,
+-- and where its saved result document and thumbnail are -- never its
+-- detections, which stay in that document.
+--
+-- status is `queued` / `processing` / `done` / `error`, the frozen four. A run
+-- the user stopped is stored as `error` with the reason saying so; the running
+-- process keeps the finer `cancelled` in memory for as long as it is up.
+CREATE TABLE IF NOT EXISTS analyze_runs (
+    run_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind              TEXT NOT NULL,
+    original_filename TEXT,
+    status            TEXT NOT NULL DEFAULT 'queued',
+    progress          REAL,
+    error             TEXT,
+    created_ts        TEXT,
+    thumbnail_path    TEXT,
+    result_path       TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sightings_plate    ON sightings (plate_text);
 CREATE INDEX IF NOT EXISTS idx_sightings_first    ON sightings (first_seen_ts);
 CREATE INDEX IF NOT EXISTS idx_sightings_src_time ON sightings (source_id, first_seen_ts);
 CREATE INDEX IF NOT EXISTS idx_alerts_created     ON alerts (created_ts);
+CREATE INDEX IF NOT EXISTS idx_analyze_created    ON analyze_runs (created_ts);
 """
 
 

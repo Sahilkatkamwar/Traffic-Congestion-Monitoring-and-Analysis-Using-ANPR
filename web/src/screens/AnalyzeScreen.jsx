@@ -4,18 +4,28 @@ import AnalyzeViewer from '../components/AnalyzeViewer'
 import PlateString from '../components/PlateString'
 import VehicleBadge from '../components/VehicleBadge'
 import Empty from '../components/Empty'
+import Modal from '../components/Modal'
+import RunRail, { isActive } from '../components/RunRail'
 import { Button, Field, Input } from '../components/Field'
 import {
   cancelAnalysis,
+  deleteAnalysis,
   exportUrl,
   getAnalysis,
   getFiles,
+  listAnalyses,
   startAnalysis,
   uploadFile,
 } from '../lib/api'
 import { asPercent } from '../lib/format'
 
-// Analyze: drop a file in, get the detections back.
+// Analyze: drop a file in, get the detections back -- and keep it.
+//
+// Since P6 every run is a row in `analyze_runs` with its result saved beside it,
+// so the rail on the left is the list of runs the server has: several can be in
+// flight at once, each with its own progress, and selecting a finished one reads
+// its saved result back rather than running a model again. A run stays until it
+// is deleted.
 //
 // This screen answers to nothing else in the app. It needs no camera, it reads
 // no source, and what it produces is never written as a sighting -- an analysis
@@ -25,6 +35,9 @@ import { asPercent } from '../lib/format'
 // printing one would be inventing it.
 
 const POLL_MS = 700
+// Nothing is running: the rail still refreshes, because another tab or another
+// browser may have started a run, but it does not ask four times a second.
+const IDLE_POLL_MS = 5000
 
 const VIDEO_TYPES = ['.mp4', '.mov', '.avi', '.mkv', '.m4v', '.webm', '.mpg', '.mpeg']
 const IMAGE_TYPES = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
@@ -223,7 +236,7 @@ function Running({ job, onCancel }) {
           {job.status === 'queued'
             ? `One analysis runs at a time so the card is not asked to hold a fourth set of models. This one is ${
                 job.queue_position ? `number ${job.queue_position}` : 'next'
-              } in the queue.`
+              } in the queue -- it is saved and will start on its own.`
             : job.detail || 'Reading the file'}
         </p>
 
@@ -490,64 +503,142 @@ function Result({ job, result, onReset, selected, onSelect, index, onIndex }) {
 
 // ---------------------------------------------------------------------- shell
 
+// P6: a run is a row on the server, not something this component remembers. So
+// the rail is polled rather than accumulated, the selected run is fetched by
+// id, and a finished run's result is read back off disk instead of being kept
+// in state -- which is what lets one be opened after a reload, or after the app
+// itself has been restarted.
+//
+// Two polls, on purpose. The list is small and tells the rail what every run is
+// doing; the detail is large -- a result document carries every box of every
+// frame -- and is only fetched for the one run being looked at.
+
+function Loading({ name }) {
+  return (
+    <div className="grid h-full place-items-center px-6">
+      <div className="max-w-md">
+        <div className="label">Opening</div>
+        <h1 className="mt-1 min-w-0 truncate text-[20px] font-semibold">
+          {name || 'This run'}
+        </h1>
+        <p className="mt-2 text-body text-ink-mid">Reading the saved result.</p>
+      </div>
+    </div>
+  )
+}
+
+function Failed({ job, onNew }) {
+  return (
+    <div className="grid h-full place-items-center px-6">
+      <div className="max-w-md">
+        <div className="label">Analysis failed</div>
+        <h1 className="mt-1 text-[20px] font-semibold">{job.name}</h1>
+        <p className="mt-2 text-body text-plate-red">{job.error}</p>
+        <div className="mt-5">
+          <Button variant="primary" onClick={onNew}>
+            Analyze another file
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function Stopped({ job, onNew }) {
+  return (
+    <div className="grid h-full place-items-center px-6">
+      <div className="max-w-md">
+        <div className="label">Stopped</div>
+        <h1 className="mt-1 text-[20px] font-semibold">{job.name}</h1>
+        <p className="mt-2 text-body text-ink-mid">
+          The analysis was stopped before it finished, so there is no result to
+          show. Start it again to read the whole file.
+        </p>
+        <div className="mt-5">
+          <Button variant="primary" onClick={onNew}>
+            Choose a file
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function AnalyzeScreen() {
-  const [jobId, setJobId] = useState(null)
+  const [runs, setRuns] = useState([])
+  const [selectedId, setSelectedId] = useState(null)
   const [job, setJob] = useState(null)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
   const [selected, setSelected] = useState(null)
   const [index, setIndex] = useState(0)
-  const timer = useRef(null)
+  const [pendingDelete, setPendingDelete] = useState(null)
+  const [deletingId, setDeletingId] = useState(null)
+  const [deleteError, setDeleteError] = useState(null)
 
-  const start = useCallback(async (uri, frameSkip) => {
-    setBusy(true)
-    setError(null)
-    try {
-      const created = await startAnalysis(uri, frameSkip)
-      setResult(null)
-      setSelected(null)
-      setIndex(0)
-      setJob(created)
-      setJobId(created.job_id)
-    } catch (exc) {
-      setError(exc.message)
-    } finally {
-      setBusy(false)
+  // The rail. Polled quickly while anything is queued or processing -- several
+  // runs can be, and each shows its own bar -- and slowly when nothing is, so an
+  // idle screen is not asking the server a question every 700ms.
+  useEffect(() => {
+    let cancelled = false
+    let timer = null
+
+    const tick = async () => {
+      let wait = IDLE_POLL_MS
+      try {
+        const list = await listAnalyses()
+        if (cancelled) return
+        setRuns(list)
+        if (list.some((run) => isActive(run.status))) wait = POLL_MS
+      } catch {
+        // A list that cannot be fetched is not worth an error banner over the
+        // run being looked at; the next tick will say if it is still broken.
+      }
+      if (!cancelled) timer = setTimeout(tick, wait)
+    }
+
+    tick()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
     }
   }, [])
 
-  // Polled rather than pushed. The websocket carries committed sightings, and an
-  // analysis produces none -- putting job progress on it would mean every Live
-  // screen in the building receives one person's upload progress.
+  // The selected run. Polled while it is going, fetched once when it is not.
   useEffect(() => {
-    if (!jobId) return undefined
+    if (!selectedId) {
+      setJob(null)
+      setResult(null)
+      return undefined
+    }
     let cancelled = false
+    let timer = null
 
     const tick = async () => {
       try {
-        const next = await getAnalysis(jobId)
+        const next = await getAnalysis(selectedId)
         if (cancelled) return
         setJob(next)
-        if (next.result) setResult(next.result)
+        setResult(next.result || null)
         if (['done', 'error', 'cancelled'].includes(next.status)) return
       } catch (exc) {
         if (cancelled) return
         setError(exc.message)
         return
       }
-      timer.current = setTimeout(tick, POLL_MS)
+      timer = setTimeout(tick, POLL_MS)
     }
     tick()
 
     return () => {
       cancelled = true
-      if (timer.current) clearTimeout(timer.current)
+      if (timer) clearTimeout(timer)
     }
-  }, [jobId])
+  }, [selectedId])
 
-  const reset = useCallback(() => {
-    setJobId(null)
+  const open = useCallback((id) => {
+    setSelectedId(id)
     setJob(null)
     setResult(null)
     setSelected(null)
@@ -555,73 +646,130 @@ export default function AnalyzeScreen() {
     setError(null)
   }, [])
 
+  const start = useCallback(
+    async (uri, frameSkip) => {
+      setBusy(true)
+      setError(null)
+      try {
+        const created = await startAnalysis(uri, frameSkip)
+        // Straight into the rail, ahead of the next poll: the run exists the
+        // moment the server answers and the list must not lag behind it.
+        setRuns((current) => [created, ...current.filter((r) => r.job_id !== created.job_id)])
+        open(created.job_id)
+      } catch (exc) {
+        setError(exc.message)
+      } finally {
+        setBusy(false)
+      }
+    },
+    [open],
+  )
+
   const stop = useCallback(async () => {
-    if (!jobId) return
+    if (!selectedId) return
     try {
-      await cancelAnalysis(jobId)
+      await cancelAnalysis(selectedId)
     } catch (exc) {
       setError(exc.message)
     }
-  }, [jobId])
+  }, [selectedId])
 
-  if (!job) {
-    return (
+  const remove = useCallback(async () => {
+    const run = pendingDelete
+    if (!run) return
+    setDeletingId(run.job_id)
+    setDeleteError(null)
+    try {
+      await deleteAnalysis(run.job_id)
+      const remaining = runs.filter((r) => r.job_id !== run.job_id)
+      setRuns(remaining)
+      setPendingDelete(null)
+      if (selectedId === run.job_id) open(remaining.length ? remaining[0].job_id : null)
+    } catch (exc) {
+      setDeleteError(exc.message)
+    } finally {
+      setDeletingId(null)
+    }
+  }, [open, pendingDelete, runs, selectedId])
+
+  const railRun = runs.find((run) => run.job_id === selectedId) || null
+
+  let panel
+  if (!selectedId) {
+    panel = (
       <div className="h-full overflow-y-auto">
         <Picker onStart={start} busy={busy} error={error} />
       </div>
     )
-  }
-
-  if (job.status === 'error') {
-    return (
-      <div className="grid h-full place-items-center px-6">
-        <div className="max-w-md">
-          <div className="label">Analysis failed</div>
-          <h1 className="mt-1 text-[20px] font-semibold">{job.name}</h1>
-          <p className="mt-2 text-body text-plate-red">{job.error}</p>
-          <div className="mt-5">
-            <Button variant="primary" onClick={reset}>
-              Try another file
-            </Button>
-          </div>
-        </div>
-      </div>
+  } else if (!job) {
+    panel = <Loading name={railRun?.name} />
+  } else if (job.status === 'error') {
+    panel = <Failed job={job} onNew={() => open(null)} />
+  } else if (job.status === 'cancelled') {
+    panel = <Stopped job={job} onNew={() => open(null)} />
+  } else if (job.status !== 'done' || !result) {
+    panel = <Running job={job} onCancel={stop} />
+  } else {
+    panel = (
+      <Result
+        job={job}
+        result={result}
+        onReset={() => open(null)}
+        selected={selected}
+        onSelect={setSelected}
+        index={index}
+        onIndex={setIndex}
+      />
     )
   }
 
-  if (job.status === 'cancelled') {
-    return (
-      <div className="grid h-full place-items-center px-6">
-        <div className="max-w-md">
-          <div className="label">Stopped</div>
-          <h1 className="mt-1 text-[20px] font-semibold">{job.name}</h1>
-          <p className="mt-2 text-body text-ink-mid">
-            The analysis was stopped before it finished, so there is no result to
-            show. Start it again to read the whole file.
-          </p>
-          <div className="mt-5">
-            <Button variant="primary" onClick={reset}>
-              Choose a file
-            </Button>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  if (job.status !== 'done' || !result) {
-    return <Running job={job} onCancel={stop} />
-  }
+  const doomed = pendingDelete
+  const doomedActive = doomed ? isActive(doomed.status) : false
 
   return (
-    <Result
-      job={job}
-      result={result}
-      onReset={reset}
-      selected={selected}
-      onSelect={setSelected}
-      index={index}
-      onIndex={setIndex}
-    />
+    <div className="flex h-full min-h-0">
+      <RunRail
+        runs={runs}
+        selectedId={selectedId}
+        onSelect={open}
+        onNew={() => open(null)}
+        onDelete={(run) => {
+          setDeleteError(null)
+          setPendingDelete(run)
+        }}
+        deletingId={deletingId}
+      />
+
+      <div className="min-h-0 min-w-0 flex-1">{panel}</div>
+
+      <Modal
+        open={Boolean(doomed)}
+        title="Delete this run?"
+        sub={doomed?.name}
+        onClose={() => (deletingId ? null : setPendingDelete(null))}
+        footer={
+          <>
+            <Button onClick={() => setPendingDelete(null)} disabled={Boolean(deletingId)}>
+              Keep it
+            </Button>
+            <Button variant="danger" onClick={remove} disabled={Boolean(deletingId)}>
+              {deletingId ? 'Deleting…' : 'Delete'}
+            </Button>
+          </>
+        }
+      >
+        <p className="text-body text-ink-mid">
+          {doomedActive
+            ? 'This run is still processing. It is stopped first, then its record, its annotated frames and crops, and its saved result are removed.'
+            : 'Its record, its annotated frames and crops, and its saved result are removed.'}{' '}
+          The file it was run on is not touched, and no other run is affected.
+        </p>
+        {deleteError && (
+          <p className="mt-3 rounded-card bg-plate-red/10 px-3.5 py-3 text-[13px] text-plate-red">
+            {deleteError}
+          </p>
+        )}
+      </Modal>
+    </div>
   )
 }
