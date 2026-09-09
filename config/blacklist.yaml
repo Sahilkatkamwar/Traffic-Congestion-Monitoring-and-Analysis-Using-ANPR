@@ -1,9 +1,20 @@
 # Registrations to raise an alert on the moment they are seen.
 #
-# This file is re-read whenever it changes -- there is nothing to restart and no
-# button to press. Save a plate here and the next sighting that matches it
-# raises an alert within seconds. The Alerts screen shows what is currently
-# loaded, and says so if a line could not be used.
+# This file is re-read whenever it changes -- there is nothing to restart. Save
+# a plate here and the next sighting that matches it raises an alert within
+# seconds. The Alerts screen shows what is currently loaded, and says so if a
+# line could not be used.
+#
+# The Alerts screen also writes here. Add and Remove on that screen rewrite the
+# `plates:` list below and nothing else: these comments are kept byte for byte,
+# and so is any line the loader could not use. Editing this file by hand is
+# still the same operation and still takes effect on the next sighting -- the
+# file is the source of truth either way.
+#
+# A new blacklist alert also sends one SMS to the control-room number, if one is
+# set. That number is set on the Alerts screen -- there is a field for it beside
+# this list -- and it is kept in config/settings.yaml under `notify:`. Only new
+# alerts, never backfilled, one message each.
 #
 # Matching is never string equality. A camera reads the same vehicle as
 # MH15HY2237 at one source and MH15HY22 at another, so an equality test answers
@@ -40,4 +51,13 @@
 #   - plate: CH01AF6401
 #     reason: example entry, delete this
 
-plates: []
+plates:
+  - plate: MH15JS9786
+    reason: "Vehicle stolen from nazji chowk"
+    severity: "info"
+  - plate: CH01BV4148
+    reason: "Stolen vehicle"
+  - plate: HP40E1260
+    reason: "stolen"
+  - plate: NL640063
+    reason: "missing"

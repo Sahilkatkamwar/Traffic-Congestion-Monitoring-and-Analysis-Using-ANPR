@@ -94,6 +94,21 @@ def sources_seed_path():
     return CONFIG_DIR / "sources.yaml"
 
 
+def settings_path():
+    """This file, as a path that can be written back to.
+
+    The control-room number is saved from the Alerts screen, and the simplest
+    safe place to keep it is the settings file it already lives in -- one line
+    rewritten, everything else left byte for byte. Overridable through
+    `paths.settings` for the same reason `paths.blacklist` is: a verification
+    run must be able to point the write at a throwaway copy rather than the
+    shipped file. The override is not in the shipped settings.yaml -- a file
+    naming itself reads badly -- it is set in memory by whoever needs it.
+    """
+    configured = load_settings()["paths"].get("settings")
+    return configured if configured is not None else CONFIG_DIR / "settings.yaml"
+
+
 def blacklist_path():
     """The plates alerts are raised on (P5).
 

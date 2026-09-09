@@ -47,6 +47,7 @@ from app import (
     config,
     db,
     matching,
+    notify,
     probe,
     sources as source_rules,
     trajectory as trace,
@@ -284,10 +285,119 @@ def create_app(pipeline=None):
         The pipeline's own instance is asked when there is one, so this cannot
         disagree with what alerts are actually raised against.
         """
-        watcher = (
-            pipeline.blacklist if pipeline is not None else alert_rules.Blacklist()
-        )
-        return watcher.describe()
+        return _watcher().describe()
+
+    def _watcher():
+        """The instance the writer matches against, when there is one.
+
+        Asking the pipeline's own Blacklist rather than a fresh one is what
+        stops this route disagreeing with what alerts are actually raised
+        against. With no pipeline -- which is how the route tests run -- a
+        throwaway instance reads the same file.
+        """
+        return pipeline.blacklist if pipeline is not None else alert_rules.Blacklist()
+
+    @app.post("/api/blacklist")
+    def add_to_blacklist(payload: dict = Body(...)):
+        """Put one registration on the blacklist.
+
+        The file stays the source of truth: this rewrites `plates:` in it and
+        leaves everything else -- the header comments, and any line the loader
+        could not use -- exactly as it was. The hot reload needs no help; the
+        write bumps the file's mtime and the writer re-reads it on the next
+        sighting.
+        """
+        try:
+            alert_rules.add_plate(
+                payload.get("plate"),
+                reason=payload.get("reason"),
+                severity=payload.get("severity") or "critical",
+            )
+        except alert_rules.BlacklistEditError as exc:
+            return fail(400, str(exc))
+        except OSError as exc:
+            return fail(
+                500,
+                f"The blacklist could not be written: {exc}. Check the file is "
+                f"not open in another program and not read-only.",
+            )
+        # The list as it now reads from disk, so the screen shows what the
+        # writer will match against rather than what it just asked for.
+        return _watcher().describe()
+
+    @app.delete("/api/blacklist/{plate}")
+    def remove_from_blacklist(plate: str):
+        try:
+            alert_rules.remove_plate(plate)
+        except alert_rules.BlacklistEditError as exc:
+            return fail(404 if "is not on the blacklist" in str(exc) else 400, str(exc))
+        except OSError as exc:
+            return fail(
+                500,
+                f"The blacklist could not be written: {exc}. Check the file is "
+                f"not open in another program and not read-only.",
+            )
+        return _watcher().describe()
+
+    def _notifier():
+        """The instance the writer sends through, when there is one.
+
+        Same reasoning as `_watcher`: asking the pipeline's own notifier is
+        what stops this route reporting a number that is not the one an alert
+        would actually go to.
+        """
+        return pipeline.notifier if pipeline is not None else notify.Notifier()
+
+    @app.get("/api/notifications")
+    def notifications():
+        """Where a blacklist alert is sent, and whether it can be.
+
+        Read-only, and it never returns a credential -- only which environment
+        variable is missing, because that is the actionable half and it is for
+        whoever runs the server, not for the browser.
+        """
+        return _notifier().describe()
+
+    @app.post("/api/notifications/number")
+    def set_control_room_number(payload: dict = Body(...)):
+        """Save the one number new blacklist alerts are sent to.
+
+        The number is configuration, not runtime state, so it is saved where it
+        already lived -- `notify.police_number` in the settings file -- with the
+        one line rewritten and the rest of that file left byte for byte. It
+        takes effect on the next alert, not on the next restart: the loaded
+        settings are updated in the same step, and the notifier reads the
+        number out of them every time it is asked.
+
+        Nothing about how an alert is decided, deduplicated or backfilled is
+        touched here. This changes only where a message goes.
+        """
+        try:
+            notify.set_police_number(payload.get("number"))
+        except notify.NumberEditError as exc:
+            return fail(400, str(exc))
+        except OSError as exc:
+            return fail(
+                500,
+                f"The number could not be saved: {exc}. Check the settings "
+                f"file is not open in another program and not read-only.",
+            )
+        return _notifier().describe()
+
+    @app.delete("/api/notifications/number")
+    def clear_control_room_number():
+        """Stop sending. Alerts are still raised and still shown on screen."""
+        try:
+            notify.set_police_number(None)
+        except notify.NumberEditError as exc:
+            return fail(400, str(exc))
+        except OSError as exc:
+            return fail(
+                500,
+                f"The number could not be removed: {exc}. Check the settings "
+                f"file is not open in another program and not read-only.",
+            )
+        return _notifier().describe()
 
     # -------------------------------------------------------- sources (P4b)
 

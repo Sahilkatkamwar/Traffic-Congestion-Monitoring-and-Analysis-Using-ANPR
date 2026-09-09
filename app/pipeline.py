@@ -41,7 +41,7 @@ import queue as queue_mod
 import threading
 import time
 
-from app import alerts as alert_rules, db
+from app import alerts as alert_rules, db, notify
 from app.worker import run_worker
 
 # Sentinel put on the inbox when the feeder has nothing left to hand over and
@@ -136,6 +136,11 @@ class Pipeline:
         # it caches the parsed file and re-reads it when the file changes --
         # sharing it across threads would mean sharing that cache.
         self.blacklist = alert_rules.Blacklist()
+        # One SMS to one control room, for a blacklist alert that was just
+        # written. It owns a queue and its own thread: the network is never
+        # touched from the writer, and a carrier that is slow or down cannot
+        # stall the one thing that writes to SQLite.
+        self.notifier = notify.Notifier()
 
     # ---------------------------------------------------------------- start up
 
@@ -503,8 +508,42 @@ class Pipeline:
         try:
             for alert in alert_rules.evaluate(conn, sighting, self.blacklist):
                 self._emit({"type": "alert", "alert": alert})
+                self._notify(conn, alert, sighting)
         except Exception as exc:  # noqa: BLE001 - never into the writer
             print(f"[writer] alert check failed: {type(exc).__name__}: {exc}")
+
+    def _notify(self, conn, alert, sighting):
+        """Send one control-room SMS for a blacklist alert that was just written.
+
+        Three properties, and each is enforced by where this call sits rather
+        than by a check inside it:
+
+        **Only new alerts.** `alert_rules.record` returns a row only when it
+        actually inserted one, and `evaluate` only yields those, so a
+        re-emitted track that raises the same alert again reaches nothing here.
+
+        **Never backfilled.** This is the commit path. Nothing scans the alerts
+        table, so turning notifications on does not message anybody about
+        yesterday's footage.
+
+        **The location is the sighting's own camera**, read from `sources` by
+        the sighting's `source_id` -- not a default, not the first placed
+        source, and null when that camera has not been put on the map, which
+        the message then says.
+
+        It cannot raise into the writer and it cannot block it: everything past
+        the queue happens on the notifier's thread.
+        """
+        if alert.get("kind") != "blacklist":
+            return
+        try:
+            row = conn.execute(
+                "SELECT name, lat, lon FROM sources WHERE source_id = ?",
+                (sighting.get("source_id"),),
+            ).fetchone()
+            self.notifier.send_alert(alert, sighting, dict(row) if row else {})
+        except Exception as exc:  # noqa: BLE001 - never into the writer
+            print(f"[writer] notification failed: {type(exc).__name__}: {exc}")
 
     def _apply(self, conn, message):
         kind = message.get("type")

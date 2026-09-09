@@ -3,7 +3,16 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import AlertCard from '../components/AlertCard'
 import EvidencePanel from '../components/EvidencePanel'
 import Empty from '../components/Empty'
-import { getAlerts, getBlacklist } from '../lib/api'
+import { Button, Field, Input, Select } from '../components/Field'
+import {
+  addBlacklistPlate,
+  clearControlRoomNumber,
+  getAlerts,
+  getBlacklist,
+  getNotifications,
+  removeBlacklistPlate,
+  setControlRoomNumber,
+} from '../lib/api'
 import { openLiveFeed } from '../lib/socket'
 import { useRoute } from '../lib/router'
 
@@ -52,13 +61,63 @@ function Filter({ options, value, onChange, label }) {
   )
 }
 
-// What the writer is matching against right now, read from the file it re-reads.
-// There is no add button because there is no table: the file IS the control, so
-// the panel names it and says what it currently holds.
-function Watching({ blacklist }) {
-  if (!blacklist) return null
+const SEVERITY_OPTIONS = [
+  { value: 'critical', label: 'Critical' },
+  { value: 'warning', label: 'Warning' },
+  { value: 'info', label: 'Info' },
+]
 
-  const { path, exists, count, plates, skipped, error } = blacklist
+// What the writer is matching against right now, and the two edits that change
+// it.
+//
+// Add and Remove answer with the list as it now stands, so what this panel
+// shows is what the next sighting will be matched against -- there is no window
+// in which the screen and the writer disagree, and nothing to restart. Where
+// the list is stored is the server's business and is not shown here: the person
+// reading this screen adds a registration, they do not edit a file.
+function Watching({ blacklist, onChanged }) {
+  const [plate, setPlate] = useState('')
+  const [reason, setReason] = useState('')
+  const [severity, setSeverity] = useState('critical')
+  const [busy, setBusy] = useState(null)
+  const [error, setError] = useState(null)
+
+  const add = async (event) => {
+    event.preventDefault()
+    setError(null)
+    setBusy('add')
+    try {
+      onChanged(
+        await addBlacklistPlate({
+          plate,
+          reason: reason.trim() || null,
+          severity,
+        }),
+      )
+      setPlate('')
+      setReason('')
+      setSeverity('critical')
+    } catch (failure) {
+      setError(failure.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const remove = async (entry) => {
+    setError(null)
+    setBusy(entry.plate)
+    try {
+      onChanged(await removeBlacklistPlate(entry.plate))
+    } catch (failure) {
+      setError(failure.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  if (!blacklist) return null
+  const { exists, count, plates, skipped, error: fileError } = blacklist
 
   return (
     <section
@@ -74,26 +133,74 @@ function Watching({ blacklist }) {
       <p className="mt-2 text-[13px] text-ink-mid">
         {count === 0
           ? exists
-            ? 'No plate is on the blacklist. Add one and it takes effect on the next sighting — there is nothing to restart.'
-            : 'There is no blacklist file yet. Create it and add plates to it; it is read as soon as it exists.'
+            ? 'No plate is on the blacklist. Add one below and it takes effect on the next sighting — there is nothing to restart.'
+            : 'Nothing is being watched yet. Add a registration below and it takes effect on the next sighting.'
           : `${count} registration${count === 1 ? '' : 's'} matched against every sighting as it is written.`}
       </p>
 
-      <p className="mt-2 text-[12px] text-ink-low">
-        Edit <code className="font-plate tracking-plate text-ink-mid">{path}</code>.
-        It is re-read whenever it changes.
-      </p>
-
-      {error && (
+      {/* The file failing to parse is the one state where adding is refused
+          rather than merged into, so it is said here and not only on failure. */}
+      {fileError && (
         <p className="mt-3 rounded-control bg-plate-red/15 px-3 py-2 text-[12.5px] text-ink-hi">
-          {error}
+          {fileError}
         </p>
       )}
 
+      <form onSubmit={add} className="hairline-t mt-3 flex flex-col gap-2.5 pt-3">
+        <Field label="Registration">
+          <Input
+            value={plate}
+            onChange={(event) => setPlate(event.target.value.toUpperCase())}
+            placeholder="MH15JS4241"
+            autoComplete="off"
+            spellCheck={false}
+            className="font-plate tracking-plate"
+            aria-label="Registration to watch"
+          />
+        </Field>
+        <Field label="Reason" hint="Shown in the alert and in the SMS. Optional.">
+          <Input
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="reported stolen 2026-08-14"
+            aria-label="Why this plate is watched"
+          />
+        </Field>
+        <Field label="Severity">
+          <Select
+            value={severity}
+            onChange={(event) => setSeverity(event.target.value)}
+            aria-label="Severity"
+          >
+            {SEVERITY_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Button
+          type="submit"
+          variant="primary"
+          disabled={busy !== null || plate.trim().length === 0}
+          className="self-start"
+        >
+          {busy === 'add' ? 'Adding…' : 'Add plate'}
+        </Button>
+        {error && (
+          <p className="text-[12.5px] text-plate-red" role="alert">
+            {error}
+          </p>
+        )}
+      </form>
+
       {plates?.length > 0 && (
-        <ul className="mt-3 flex flex-col gap-1.5">
+        <ul className="hairline-t mt-3 flex flex-col gap-1 pt-3">
           {plates.map((entry) => (
-            <li key={entry.plate} className="flex items-baseline gap-2">
+            <li
+              key={entry.plate}
+              className="group flex items-baseline gap-2 rounded-control px-1.5 py-1 transition-colors duration-150 hover:bg-surface-2"
+            >
               <span className="font-plate tracking-plate text-[14px] font-semibold text-ink-hi">
                 {entry.plate}
               </span>
@@ -103,10 +210,21 @@ function Watching({ blacklist }) {
                 </span>
               )}
               {entry.severity !== 'critical' && (
-                <span className="ml-auto shrink-0 text-[11px] uppercase tracking-wide text-ink-low">
+                <span className="shrink-0 text-[11px] uppercase tracking-wide text-ink-low">
                   {entry.severity}
                 </span>
               )}
+              <button
+                type="button"
+                onClick={() => remove(entry)}
+                disabled={busy !== null}
+                aria-label={`Remove ${entry.plate} from the blacklist`}
+                className="ml-auto shrink-0 rounded-control px-2 py-0.5 text-[12px] text-ink-low
+                  transition-colors duration-150 hover:bg-plate-red/20 hover:text-plate-red
+                  focus-visible:text-plate-red disabled:cursor-not-allowed"
+              >
+                {busy === entry.plate ? '…' : 'Remove'}
+              </button>
             </li>
           ))}
         </ul>
@@ -114,11 +232,11 @@ function Watching({ blacklist }) {
 
       {/* A line that could not be used is named with its reason, because a
           blacklist that silently ignored an entry is a blacklist nobody can
-          trust. */}
+          trust. Adding or removing a plate never removes one of these. */}
       {skipped?.length > 0 && (
         <div className="hairline-t mt-3 pt-3">
           <div className="label text-plate-yellow">
-            {skipped.length} line{skipped.length === 1 ? '' : 's'} skipped
+            {skipped.length} entr{skipped.length === 1 ? 'y' : 'ies'} not being watched
           </div>
           <ul className="mt-1.5 flex flex-col gap-1 text-[12px] text-ink-mid">
             {skipped.map((item, index) => (
@@ -135,12 +253,172 @@ function Watching({ blacklist }) {
   )
 }
 
+// Where a blacklist alert is sent, and the one place it is set.
+//
+// One number, and it is the control room's -- never a vehicle owner's. Nothing
+// in this app knows who owns a vehicle.
+//
+// The number is typed here and saved here. Nothing about the SMS account is
+// readable from a browser and nothing about it is asked for: that belongs to
+// whoever runs the server, and a screen that asked a control-room operator for
+// an API key would be asking the wrong person for the wrong thing.
+//
+// The panel is honest about the two things a browser cannot see: whether the
+// server can actually send, and what happened to the last message. A
+// notification that silently failed is the one state worth a red line here.
+function ControlRoom({ status, onChanged }) {
+  const saved = status?.configured_number || ''
+  const [number, setNumber] = useState(saved)
+  const [busy, setBusy] = useState(null)
+  const [error, setError] = useState(null)
+  const [saidOk, setSaidOk] = useState(null)
+
+  // The field follows the server whenever the saved number changes underneath
+  // it -- a reload, or another tab -- but never while it is being typed into.
+  const shown = useRef(saved)
+  useEffect(() => {
+    if (saved !== shown.current) {
+      shown.current = saved
+      setNumber(saved)
+    }
+  }, [saved])
+
+  if (!status) return null
+  const { police_number: number_in_use, ready, reason, sent, failed, last } = status
+  const changed = number.trim() !== saved
+
+  const save = async (event) => {
+    event.preventDefault()
+    setError(null)
+    setSaidOk(null)
+    setBusy('save')
+    try {
+      const next = await setControlRoomNumber(number.trim())
+      shown.current = next.configured_number || ''
+      setNumber(shown.current)
+      onChanged(next)
+      setSaidOk(
+        next.ready
+          ? `Saved. New blacklist alerts go to ${next.police_number}.`
+          : `Saved ${next.police_number}.`,
+      )
+    } catch (failure) {
+      setError(failure.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const clear = async () => {
+    setError(null)
+    setSaidOk(null)
+    setBusy('clear')
+    try {
+      const next = await clearControlRoomNumber()
+      shown.current = ''
+      setNumber('')
+      onChanged(next)
+      setSaidOk('Number removed. Alerts are still raised and still shown here.')
+    } catch (failure) {
+      setError(failure.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <section
+      className="mt-5 rounded-card bg-surface-1 p-4"
+      style={{ boxShadow: 'var(--shadow-lift)' }}
+      aria-label="Control room"
+    >
+      <div className="flex items-baseline justify-between gap-3">
+        <div className="label">Control room</div>
+        <span
+          className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${
+            ready ? 'bg-plate-green/20 text-plate-green' : 'bg-surface-2 text-ink-low'
+          }`}
+        >
+          {ready ? 'Sending' : 'Not sending'}
+        </span>
+      </div>
+
+      {number_in_use && (
+        <p className="mt-2 font-plate tracking-plate text-[16px] font-semibold text-ink-hi">
+          {number_in_use}
+        </p>
+      )}
+      <p className="mt-1 text-[12.5px] text-ink-mid">{reason}</p>
+
+      <form onSubmit={save} className="hairline-t mt-3 flex flex-col gap-2.5 pt-3">
+        <Field
+          label="Phone number"
+          hint="With the country code, like +919876543210."
+        >
+          <Input
+            type="tel"
+            value={number}
+            onChange={(event) => setNumber(event.target.value)}
+            placeholder="+919876543210"
+            autoComplete="off"
+            spellCheck={false}
+            className="font-plate tracking-plate"
+            aria-label="Control-room phone number"
+          />
+        </Field>
+        <div className="flex items-center gap-2">
+          <Button
+            type="submit"
+            variant="primary"
+            disabled={busy !== null || number.trim().length === 0 || !changed}
+          >
+            {busy === 'save' ? 'Saving…' : saved ? 'Update number' : 'Save number'}
+          </Button>
+          {saved && (
+            <Button type="button" variant="quiet" onClick={clear} disabled={busy !== null}>
+              {busy === 'clear' ? 'Removing…' : 'Remove'}
+            </Button>
+          )}
+        </div>
+        {error && (
+          <p className="text-[12.5px] text-plate-red" role="alert">
+            {error}
+          </p>
+        )}
+        {saidOk && !error && (
+          <p className="text-[12.5px] text-plate-green" role="status">
+            {saidOk}
+          </p>
+        )}
+      </form>
+
+      <p className="hairline-t mt-3 pt-3 text-[12px] text-ink-low">
+        One SMS per new blacklist alert — never for an alert already raised, and
+        never for footage already in the database.
+      </p>
+
+      {(sent > 0 || failed > 0) && (
+        <p className="mt-2 text-[12.5px] text-ink-mid">
+          {sent} sent{failed > 0 ? `, ${failed} failed` : ''} this run.
+        </p>
+      )}
+
+      {last && !last.ok && (
+        <p className="mt-2 rounded-control bg-plate-red/15 px-3 py-2 text-[12.5px] text-ink-hi">
+          The last notification did not go out: {last.detail}
+        </p>
+      )}
+    </section>
+  )
+}
+
 export default function AlertsScreen() {
   const { navigate } = useRoute()
   const reduced = useReducedMotion()
 
   const [alerts, setAlerts] = useState([])
   const [blacklist, setBlacklist] = useState(null)
+  const [notifications, setNotifications] = useState(null)
   const [kind, setKind] = useState(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(null)
@@ -155,13 +433,15 @@ export default function AlertsScreen() {
   const load = useCallback(async (forKind) => {
     wanted.current = forKind
     try {
-      const [rows, watched] = await Promise.all([
+      const [rows, watched, sending] = await Promise.all([
         getAlerts(LIMIT, { kind: forKind }),
         getBlacklist(),
+        getNotifications(),
       ])
       if (wanted.current !== forKind) return
       setAlerts(rows)
       setBlacklist(watched)
+      setNotifications(sending)
       setLoadError(null)
     } catch (error) {
       if (wanted.current !== forKind) return
@@ -253,7 +533,7 @@ export default function AlertsScreen() {
                   kind === 'impossible_transition'
                     ? 'An impossible transition needs one vehicle read at two cameras that are placed on the map. Place your sources in Sources and run them, and any journey too fast to have happened appears here.'
                     : blacklist && blacklist.count === 0
-                      ? `Nothing is on the blacklist yet. Add a registration to ${blacklist.path} and the next sighting that matches it raises an alert here — within seconds, with no restart.`
+                      ? 'Nothing is on the blacklist yet. Add a registration in the panel beside this and the next sighting that matches it raises an alert here — within seconds, with no restart.'
                       : 'Alerts appear here as they are raised, while sources are running. Nothing has matched yet.'
                 }
               />
@@ -274,7 +554,12 @@ export default function AlertsScreen() {
           </div>
 
           <aside className="lg:sticky lg:top-6 lg:self-start">
-            <Watching blacklist={blacklist} />
+            {/* Add and Remove answer with the list as it now reads from disk,
+                so the panel is updated from the response rather than from a
+                refetch -- there is no window in which the screen and the file
+                disagree. */}
+            <Watching blacklist={blacklist} onChanged={setBlacklist} />
+            <ControlRoom status={notifications} onChanged={setNotifications} />
           </aside>
         </div>
       </div>

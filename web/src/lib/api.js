@@ -61,8 +61,29 @@ export function getAlerts(limit = 20, { kind = null, severity = null } = {}) {
 }
 
 // What the writer is currently matching against, read straight from the file
-// it re-reads. There is no write here on purpose: the file is the control.
+// it re-reads. The two writes edit that same file -- they rewrite its `plates:`
+// list and leave its comments and any unusable line alone -- so the file stays
+// the source of truth and the hot reload needs nothing: the next sighting
+// re-reads it. Both answer with the list as it now reads from disk, so the
+// screen shows what the writer will match against rather than what it asked for.
 export const getBlacklist = () => get('/api/blacklist')
+export const addBlacklistPlate = ({ plate, reason, severity }) =>
+  post('/api/blacklist', { plate, reason, severity })
+export const removeBlacklistPlate = (plate) =>
+  send(`/api/blacklist/${encodeURIComponent(plate)}`, { method: 'DELETE' })
+
+// Where a blacklist alert is sent, and whether it can be. Never a credential:
+// the SMS account is the server's business and is not readable from here.
+//
+// The number is the one thing on this screen that is set rather than read. Both
+// writes answer with the status as it now stands, so the panel is updated from
+// the response and there is no window in which it shows a number that is not
+// the one the next alert would go to.
+export const getNotifications = () => get('/api/notifications')
+export const setControlRoomNumber = (number) =>
+  post('/api/notifications/number', { number })
+export const clearControlRoomNumber = () =>
+  send('/api/notifications/number', { method: 'DELETE' })
 
 // --- sources (P4b) ---------------------------------------------------------
 

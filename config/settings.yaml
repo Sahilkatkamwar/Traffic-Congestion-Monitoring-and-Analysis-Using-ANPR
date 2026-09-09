@@ -82,6 +82,64 @@ server:
   host: 127.0.0.1
   port: 8000
 
+# --- control-room SMS -------------------------------------------------------
+# One phone number, notified when a blacklisted plate is actually seen. This is
+# the police / control room, NOT the vehicle's owner -- nothing in this app
+# knows who owns a vehicle and nothing here tries to.
+#
+# Only a NEW blacklist alert sends. The alert row is written first, by the one
+# writer, and only a row that was actually inserted is offered to the notifier,
+# so a re-emitted track cannot send a second message and switching this on does
+# not message anybody about footage already in the database.
+#
+# The provider is TextBee, which is a gateway rather than a carrier: the message
+# is handed to the TextBee app on an Android phone you own, and THAT PHONE sends
+# it over its own SIM on your own mobile plan. So there is no sending number to
+# configure -- the SIM in the device is the sender -- and nothing here is billed
+# to an account with a balance.
+#
+# NO CREDENTIAL GOES IN THIS FILE. This file is in git. The API key and the
+# device id are read from the environment at send time:
+#
+#   TEXTBEE_API_KEY     the API key from the TextBee dashboard
+#   TEXTBEE_DEVICE_ID   which of that account's registered phones sends
+#
+# police_number below IS the control-room number, and it is normally set from
+# the Alerts screen rather than here: Save on that screen rewrites that one line
+# and leaves every other line of this file byte for byte, so the number survives
+# a restart and takes effect on the very next alert. Editing it here by hand is
+# the same operation and neither way is second class.
+#
+# It is required in international format, +<country code><number> -- a bare
+# 10-digit number is refused rather than guessed at, so an Indian control room
+# is +919960089069 and not 9960089069. Quote it: YAML reads a bare
+# +919960089069 as the integer 919960089069 and silently loses the country code.
+#
+# ANPR_POLICE_NUMBER is a FALLBACK, used only when police_number is null. It
+# used to be an override, and it was changed on 2026-09-04 when the number
+# became something you type into the browser: a number entered on a screen that
+# was then silently overridden by the environment would show one number and
+# send to another, which is the worst failure this feature has available to it.
+notify:
+  # textbee -- send for real through your Android phone, using the environment
+  #            variables above
+  # console -- compose the message and print it to the log, sending nothing.
+  #            Set this to see the feature work with no gateway account at all;
+  #            it cannot message a real phone by accident, and it is what the
+  #            verification suite runs against.
+  # none    -- off
+  provider: textbee
+  enabled: true
+  # The control room, in international format: "+<country code><number>".
+  # null means nothing is sent, and the Alerts screen says so and offers the
+  # field to set it in. Written by that screen; safe to edit by hand.
+  police_number: "+919960089069"
+  # Blacklist alerts at or above this severity are sent. `info` is everything.
+  # A fuzzy blacklist hit is capped at `warning` by app/alerts.py and says how
+  # far off it was, so `critical` here means "only a character-for-character
+  # match wakes anybody up".
+  min_severity: info
+
 defaults:
   frame_skip: 3          # process every Nth frame; too aggressive breaks tracking
   imgsz: 640

@@ -2203,3 +2203,523 @@ produce sightings.
 `web/dist` is built. The P4e session could not build it; `npm run build` finished
 here in 1.6s, so that was an environment limit on child processes in that
 session and it is gone.
+
+---
+
+# P5+ - Blacklist management and control-room SMS
+
+Added on top of P5's Alerts, on 2026-09-04. **Nothing about how an alert is
+decided changed**: `app/alerts.py`'s matching, its severity cap and its
+deduplication are untouched, the three tables are the frozen columns they were,
+and `p5_verify` still passes 109 of 109 without a line altered.
+
+## What was asked, and what each half is
+
+**Manage the blacklist from /alerts** -- plate, reason, severity, add and
+remove -- with `config/blacklist.yaml` still the source of truth and its hot
+reload preserved.
+
+**One configurable police / control-room phone number**, sent an SMS when a NEW
+blacklisted sighting raises an alert, carrying the plate, severity, vehicle
+type, camera, sighting time, that camera's coordinates and the reason. No
+backfill, no duplicates.
+
+## No SMS provider existed. What was added
+
+Checked first: nothing in this repo mentioned Twilio, MSG91, Vonage, Plivo,
+SMTP or any other sender, and `requirements.txt` names no HTTP client.
+
+> **Provider changed 2026-09-04: Twilio -> TextBee.** The Twilio implementation
+> is gone; everything else in this section -- the message, the dispatch point,
+> the three guarantees, the blacklist editing -- is unchanged, and both suites
+> reproduce their counts exactly. See "TextBee" below.
+
+`app/notify.py` speaks the SMS gateway's REST API over **stdlib `urllib`**.
+That is the smallest clean integration and it is deliberate: `requests` and
+`httpx` are both installed in `env\` but neither is in `requirements.txt`, and
+CLAUDE.md forbids adding a dependency or running pip. **No dependency was added
+and no pip was run**, for Twilio then or TextBee now.
+
+Three providers: `textbee` sends; `console` composes the real message and
+prints it, which is what the verification suite runs against, so the whole path
+is exercised with no gateway account and no way to reach a real phone; `none`
+is off.
+
+**Credentials are environment, never configuration**, because
+`config/settings.yaml` is in git:
+
+    TEXTBEE_API_KEY        the API key from the TextBee dashboard
+    TEXTBEE_DEVICE_ID      which of that account's phones sends
+    ANPR_POLICE_NUMBER     optional; overrides notify.police_number
+
+The `notify:` block in `config/settings.yaml` carries the provider, the one
+control-room number and a severity floor -- none of them a secret.
+
+## The file stays the source of truth
+
+`POST /api/blacklist` and `DELETE /api/blacklist/<plate>` edit
+`config/blacklist.yaml` the way a person with an editor would: read it, change
+the `plates:` list, write it back atomically with `os.replace`. **The hot reload
+needed no change at all** -- the write bumps mtime and size, and the writer's
+existing `Blacklist.refresh()` re-reads on the next sighting.
+
+Three properties, each verified rather than assumed:
+
+- the comment header survives byte for byte;
+- a line the loader could not use is kept, and still reported as skipped -- the
+  rewrite is built from the raw parsed list, not from `Blacklist.entries`;
+- a file that does not parse is refused with the parse error, not overwritten.
+
+Both routes answer with the list as it now reads from disk, so the screen shows
+what the writer will match against rather than what it asked for.
+
+## The three guarantees come from where the dispatch sits
+
+`Pipeline._notify`, called from `_raise_alerts` on the rows
+`alert_rules.evaluate` returns:
+
+**Only new alerts.** `record()` returns a row only when it actually inserted
+one. A re-emitted track raises nothing to send, and the notifier keeps the
+alert_ids it accepted as a second guard.
+
+**Never backfilled.** Nothing reads the alerts table.
+
+**Never on the writer thread.** `send_alert` queues and returns; a daemon
+thread does the network. The writer is the only thing that writes to SQLite and
+a slow carrier must not be able to stall every source.
+
+The blacklist entry's `reason` reaches the message on the dict `evaluate`
+returns, **not through the database**. `record()` writes the seven frozen
+columns and nothing else.
+
+## Exit criteria - verified
+
+`scratch/p5_notify_verify.py`, **126 passed, 0 failed, 0 skipped in 11s**. Log
+in `scratch/p5_notify_verify.log`. Throwaway database, throwaway blacklist,
+`provider: console` -- the application database and the shipped
+`config/blacklist.yaml` are never written by it.
+
+| check | result |
+|---|---|
+| add a blacklist entry | ✅ plate normalised, reason and severity stored, refusals named |
+| remove one | ✅ by normalised plate; `UP 16 CD 9090` removes `UP16CD9090` |
+| the header comments survive | ✅ byte for byte |
+| an unusable line survives | ✅ kept, and still reported as skipped |
+| an unparseable file | ✅ refused, left byte-identical |
+| hot reload | ✅ the writer's own watcher sees an add and a remove with no restart |
+| two edits in one filesystem tick | ✅ both seen |
+| blacklist alert creation | ✅ critical on an exact read, warning on a fuzzy one |
+| police SMS | ✅ one message, to the configured number |
+| plate / severity / vehicle type / camera / time / reason in it | ✅ each asserted |
+| correct camera location | ✅ the sighting's own camera; a second camera gives its own coordinates and not the first's |
+| an unplaced camera | ✅ says so, borrows nobody's coordinates, still alerts |
+| no duplicate | ✅ a re-emitted track: 1 alert, 1 message |
+| no backfill | ✅ sightings committed first, plate added after: 0 messages |
+| removing the plate | ✅ stops messages on the next sighting |
+| a sighting with no plate | ✅ notifies nobody |
+| the writer is not blocked | ✅ `send_alert` returned in **0 ms** against a 1500 ms carrier |
+| a failing carrier | ✅ 3 attempts, counted and shown, never raised into the writer |
+| no credential is served | ✅ a token set in the environment is absent from `/api/notifications` |
+| the frozen schema | ✅ alerts still 7 columns, sightings still 14 |
+
+## Regression - 3 failures, all three the documented ones
+
+    p1_verify              21/22   documented environmental webcam failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision  14/14
+    p2_verify              33/34   documented ocr_tworow500 calibration failure
+    p3_verify              57/57
+    p4a_verify             25/25
+    p4b_verify             74/74
+    p4c_verify             75/75
+    p4d_verify             79/81   documented application-database failures
+    p4e_verify            128/129  the same
+    p5_verify            109/109
+    p5_notify_verify     126/126   new
+
+Logs in `scratch/reg_*.log`, `scratch/p5_reverify.log` and
+`scratch/p5_notify_verify.log`. **`p5_verify` is unchanged and still 109 of
+109**, which is the statement that P5's alert behaviour did not move. The p4d
+and p4e failures reproduce the counts this file already records for them -- the
+application database holds 346 sightings from 1 unplaced source, so those two
+suites' "real data" sections ask for journeys that are not in it.
+
+## Runnable
+
+The real `create_app` against the real settings and the real
+`config/blacklist.yaml`, on port 8018:
+
+    200  /api/health          {"status":"ok","db":true,"sources":1,"sightings":346,"ui_built":true}
+    200  /api/blacklist       {"path":"config/blacklist.yaml","count":0,"error":null}
+    200  /api/notifications   {"provider":"console","police_number":null,"ready":false,...}
+    200  /alerts              the built UI
+
+`web/dist` rebuilt in 1.6s. `config/blacklist.yaml` still ships empty --
+`plates: []` is unchanged and only its comment header gained the paragraphs
+describing the screen and the SMS.
+
+## What is not done, and is not pretended to be
+
+- **The phone number is set in `config/settings.yaml` or the environment, not
+  from the UI.** The screen shows it, whether it can send, and how to fix it if
+  it cannot. Editing it from the browser would mean the app rewriting its own
+  heavily-commented settings file, which is a larger change than the ask
+  justifies. Stated as an assumption rather than done quietly.
+- ~~**`provider: twilio` has never been run against Twilio here.**~~ Superseded:
+  the provider is TextBee and it HAS been run against the live gateway, once,
+  with a test plate. See "TextBee" below.
+- **One number, not a list.** A distribution list is a question about who is on
+  shift, and this app has nowhere to answer it. The control room forwards.
+
+---
+
+# TextBee replaces Twilio as the SMS provider -- 2026-09-04
+
+The control-room SMS now goes out **through the user's own Android phone on the
+user's own SIM and mobile plan**, instead of through a Twilio account. Nothing
+else about alerting moved: `app/alerts.py` was not opened, the three frozen
+tables are the columns they were, and the dispatch is the same call in the same
+place on the same thread.
+
+## What was replaced, and what deliberately was not
+
+Replaced, and it is the whole change:
+
+- `_twilio()` -> `_textbee()`. A JSON POST with an `x-api-key` header, over
+  stdlib `urllib`, where Twilio was a form POST with HTTP basic auth. **No
+  dependency was added and no pip was run** -- `base64` is no longer imported
+  because nothing needs it any more.
+- `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM_NUMBER` /
+  `TWILIO_MESSAGING_SERVICE_SID` -> `TEXTBEE_API_KEY` / `TEXTBEE_DEVICE_ID`.
+  Four variables become two, and **the "from" number disappears entirely**:
+  TextBee is a gateway rather than a carrier, so the SIM in the registered
+  device IS the sender and there is nothing to configure.
+- `PROVIDERS` is `("textbee", "console", "none")`, and `notify.provider` in
+  `config/settings.yaml` is `textbee`.
+
+Not touched, on purpose, because the ask was a provider swap:
+
+- **the notifier interface.** `Notifier.send_alert(alert, sighting, source)`,
+  `readiness()`, `describe()`, `drain()`, the transport injection point and the
+  `(to, body) -> reference` transport contract are all identical. A transport is
+  still a callable taking two strings, which is why the verification suite's
+  injected `Recorder` needed no change at all.
+- **the message.** `compose()` is byte-identical. Plate, severity, vehicle type,
+  camera name, sighting time, that camera's own coordinates with a maps link,
+  and the reason -- in that order, with "camera not placed on the map" when the
+  source has no coordinates.
+- **deduplication and no-backfill.** Both come from where the dispatch sits
+  (`Pipeline._notify`, on rows `alert_rules.evaluate` actually inserted) plus
+  the notifier's own accepted-`alert_id` set. Neither is in the transport, so
+  neither could be affected by changing it. Re-verified below rather than
+  assumed.
+- **the queue and the thread.** `send_alert()` still returns without touching
+  the network; a daemon thread still does the three attempts with backoff.
+- **the frontend.** `AlertsScreen.jsx` reads `provider`, `ready`, `reason`,
+  `sent`, `failed` and `last` from `/api/notifications` and never named a
+  provider, so it renders `textbee` with no edit. `web/dist` did not need
+  rebuilding.
+- **the database.** Nothing in this change reads or writes a table.
+
+## Cloudflare refuses the stdlib's default User-Agent
+
+The first live call failed with **HTTP 403 and a body of `error code: 1010`**,
+for a correct API key against a real, enabled device. 1010 is Cloudflare
+refusing a client by its signature, not TextBee refusing the message, and the
+response carries no JSON for the error path to read.
+
+Measured rather than guessed: three requests to
+`GET /api/v1/gateway/devices` differing **only** in the `User-Agent` header --
+
+    Python-urllib/3.11 (the stdlib default)   HTTP 403, "error code: 1010"
+    anpr-city/1.0                             HTTP 200
+    Mozilla/5.0 (Windows NT 10.0; Win64; x64) HTTP 200
+    curl/8.4.0                                HTTP 200
+
+So `_textbee` sends `User-Agent: anpr-city/1.0`, which names this client
+honestly. It is one header and it is the difference between the feature working
+and the feature 403ing with an unreadable body. Recorded here because the next
+person to hit a 1010 from stdlib `urllib` will otherwise go looking at their
+key.
+
+## Verified against the live gateway, once, with a test plate
+
+`scratch/p5_textbee_test.py` -- not part of any suite, because the suites must
+never reach the network. It composes a real alert through the real `compose()`
+and sends it through the real `_textbee()` to the real API, with the plate
+`TEST000000` and the reason "TextBee provider test, no vehicle was seen", so
+nothing that arrives can be mistaken for a sighting.
+
+    sending to +919960089069:
+    ANPR INFO: blacklisted plate seen
+    Plate: TEST000000
+    Vehicle: car
+    Camera: Test bench (not a camera)
+    Time: 2026-09-04 09:14:07 UTC
+    Location: 19.99720, 73.78980
+    https://www.google.com/maps?q=19.99720,73.78980
+    Reason: TextBee provider test, no vehicle was seen
+
+    accepted by the gateway, reference 6a9aa9dbccb6c72709a3d00e
+
+The device it went to is the account's registered `samsung SM-S911B`,
+`enabled: true`. **The gateway accepting a message is not proof the SIM sent
+it** -- that is the phone's business and this app cannot see it. What is proven
+is that the credentials, the endpoint, the headers, the body shape and the
+reference extraction are all correct.
+
+## Readiness, checked at every configuration
+
+Each string is what the Alerts screen shows, and each names the thing to fix:
+
+| state | what `readiness()` says |
+|---|---|
+| nothing set | `No control-room number: no number set. Set notify.police_number ... or the ANPR_POLICE_NUMBER environment variable.` |
+| number set, key missing | `TEXTBEE_API_KEY and TEXTBEE_DEVICE_ID not set in the environment. Set them and restart the app.` |
+| number `9960089069` | `9960089069 is not in international format. Write it as +<country code><number>, for example +919876543210.` |
+| all set | `Ready. Alerts go to +919960089069, sent from your own phone.` |
+
+**A bare national number is still refused rather than guessed at.** `+91` was
+not assumed for it: the app has no way to know which country a 10-digit number
+belongs to, and a wrongly-assumed country code sends a control-room alert to a
+stranger. The number must be written `+919960089069`.
+
+`/api/notifications` still returns environment variable **names** and never
+their values -- verified by setting a key to a known string and asserting that
+string is absent from the response.
+
+## Setup
+
+    set TEXTBEE_API_KEY=txb_...              from the TextBee dashboard
+    set TEXTBEE_DEVICE_ID=...                the phone that sends
+    set ANPR_POLICE_NUMBER=+919960089069     the control room, +E.164
+    env\Scripts\python.exe -m app.run
+
+1. Install the TextBee app on the Android phone that should send, sign in and
+   register it -- that phone's SIM sends every alert, on its own plan.
+2. Take the API key from the dashboard and the device id from the device list
+   (or `GET https://api.textbee.dev/api/v1/gateway/devices` with the key).
+3. Set the three variables **in the environment, never in a tracked file**.
+4. Leave `notify.provider: textbee` in `config/settings.yaml`, or set it to
+   `console` to watch the composed message in the log without sending.
+5. Add a plate on `/alerts` and run a source. The next matching sighting sends.
+
+To check the transport without waiting for a sighting:
+
+    env\Scripts\python.exe scratch\p5_textbee_test.py
+
+## Regression -- both suites reproduce their counts exactly
+
+    p5_notify_verify     126/126     unchanged
+    p5_verify            109/109     unchanged
+
+`p5_notify_verify` needed **two identifier renames and nothing else**: the check
+that `/api/notifications` names the variable holding the credential and never
+returns its value now sets `TEXTBEE_API_KEY` and `TEXTBEE_DEVICE_ID` instead of
+the two Twilio ones. Every other check -- the dedup, the severity floor, the
+not-configured skip, the retry-and-report on a refusing transport, the 0 ms
+return on the writer thread, the field-by-field message, the end-to-end commit
+with no second message and no backfill -- passes **unmodified**, which is the
+statement that the notifier's interface really did stay put.
+
+`p5_verify` at 109/109 is the statement that alerting itself did not move.
+
+## What is still not done
+
+- ~~**The number is set in config or the environment, not from the UI.**~~
+  **Done 2026-09-04** -- see the section below. It is set on the Alerts
+  screen, saved to `notify.police_number`, and used from the next alert on.
+- **Delivery is not confirmed.** The gateway returning 2xx means it accepted the
+  message for the device. Whether the SIM sent it, and whether it arrived, is
+  not read back -- TextBee exposes delivery status and this does not poll it.
+- **One number, not a list.** Unchanged.
+- **The phone is now a dependency.** A carrier account cannot be off, out of
+  battery, out of signal or out of credit; the phone in the control room can be
+  all five. That is the cost of sending on your own plan and it is a real one.
+
+# P5+ - The Alerts screen is a screen, and the number is set on it
+
+Two changes to the P5 Alerts work, neither of which touched how an alert is
+decided. `app/alerts.py` is byte-identical. Matching, the severity cap, the
+deduplication, the no-backfill guarantee, the frozen three tables, OCR,
+detection, tracking and re-identification were not opened. `p5_verify` is still
+**109 of 109**, and every `p5_notify_verify` check that existed before this pass
+still passes unmodified.
+
+## 1. What a control-room operator was being shown, and is not any more
+
+The Alerts screen was rendering things only the person who built the app can act
+on. All of it is gone:
+
+| was on screen | why it should not have been |
+|---|---|
+| `Stored in config/blacklist.yaml. Edit it by hand...` | the reader has no editor and no filesystem |
+| `Set the number in config/settings.yaml under notify:` | the same, and it was the only way to set it |
+| `Credentials are read from the environment, never from that file.` | true, and addressed to nobody present |
+| `Provider textbee.` | an implementation detail |
+| `No number set` | a developer's null, where a number belongs |
+| `N lines skipped` | a file's word for an entry that is not being watched |
+
+Each of those strings is asserted **absent from the built bundle** by
+`p5_notify_verify` section H -- from the built JavaScript, not from the source,
+because the bundle is what a browser runs.
+
+What replaced the file path is not a shorter file path. The blacklist panel now
+says what an edit *does*: "it takes effect on the next sighting -- there is
+nothing to restart", which is the only part of "the file is re-read whenever it
+changes" the reader could ever have acted on.
+
+`Notifier.readiness()` returns three values instead of two for the same reason.
+`reason` is the sentence the screen renders, and it names no file, no setting
+key and no environment variable; `setup_detail` is the server-side half, which
+goes to the log and to `/api/notifications` and never to a rendered element. The
+suite checks the sentence for what it must **not** contain as well as for what
+it must:
+
+| state | what the screen now says |
+|---|---|
+| nothing set | `No control-room number yet. Enter one below and new blacklist alerts are sent to it.` |
+| set, ready | `New blacklist alerts are sent to +919960089069.` |
+| set, provider `console` | `Alerts for +919960089069 are written to the log rather than sent.` |
+| set, no credentials on the server | `SMS sending is not set up on this server, so nothing can be sent to +919960089069.` |
+| `9960089069` | `9960089069 is not in international format. Write it as +<country code><number>, for example +919876543210.` |
+
+## 2. The number is typed into the browser
+
+A **Control room** panel beside the blacklist: a phone field, Save (Update once
+one is set), Remove, the number currently in use, a Sending / Not sending pill,
+and one plain success or error line. Behind it:
+
+    POST   /api/notifications/number   {"number": "+919960089069"}
+    DELETE /api/notifications/number
+
+Both answer with the status as it now stands, so the panel is updated from the
+response rather than from a refetch and there is no window in which the screen
+shows a number that is not the one the next alert would go to.
+
+**No credential is asked for and none is returned.** A control-room operator is
+the wrong person to ask for an SMS gateway API key, so the screen does not.
+
+## Where the number is kept, and why there is nothing new to keep it in
+
+`notify.police_number` in `config/settings.yaml` -- where that number always
+lived. Nothing new became authoritative, no schema moved, and the frozen tables
+were not touched. `notify.set_police_number` rewrites that one line the way
+`alerts.add_plate` rewrites `plates:`: line-based rather than through PyYAML,
+because settings.yaml is mostly comments and those comments are how every
+measurement in CLAUDE.md is recorded.
+
+Measured on the shipped file: **one line of 487 changes and the other 486 are
+byte-identical**, line endings included. The read and the write both pass
+`newline=""` -- Python's default translates CRLF to LF on the way in and back on
+the way out, which would rewrite every line of a file this is allowed to change
+one line of. Invisible in a diff of the content, very visible in a diff of the
+bytes.
+
+Three properties, verified rather than asserted:
+
+- **validated before the write, not after.** A number with no country code is
+  refused with the sentence saying so, and the file is byte-identical
+  afterwards. `+919960089069`, never `9960089069`: the app cannot know which
+  country a bare 10-digit number belongs to, and a guessed country code sends a
+  control-room alert to a stranger.
+- **quoted.** YAML 1.1 reads a bare `+919960089069` as the integer
+  `919960089069` and silently loses the country code, so what is written is
+  `police_number: "+919960089069"`.
+- **a file that does not parse is refused, not overwritten**, and the rewritten
+  text is parsed and read back *before* it replaces anything. A line-based edit
+  that produced something PyYAML disagreed with would take the app down on its
+  next start, and that read-back is the last place to catch it.
+
+It takes effect on the **next alert**, not the next restart. The loaded settings
+are a cached dict and the notifier reads the number out of it every time it is
+asked, so the save updates that one key alongside the file. A full
+`load_settings(reload=True)` was deliberately not used: it would also discard
+any redirection a verification run has set up.
+
+`paths.settings` redirects the write, exactly as `paths.blacklist` already
+redirects the other one, so no suite edits the shipped file.
+
+## `ANPR_POLICE_NUMBER` is now a fallback, not an override
+
+It used to win over the file. It now applies **only when nothing is saved**.
+
+This is the one behaviour change in this pass and it is deliberate: a number
+typed into a screen and then silently overridden by the environment would show
+one number and send to another, which is the worst state this feature has
+available to it. A deployment that has never set a number from the browser is
+unaffected. The comment block above `notify:` in `config/settings.yaml` says so.
+
+## Verification
+
+`scratch/p5_notify_verify.py` -- **158 passed, 0 failed, 0 skipped in 11s**, up
+from 126. Section I is new. Throwaway database, throwaway blacklist, throwaway
+copy of settings.yaml; `notify.provider` forced to `console`, so nothing in the
+suite can reach a carrier.
+
+`scratch/p5_number_live.py` -- **15 passed, 0 failed**, new. The half one
+process cannot prove. It starts the real app against the **shipped**
+settings.yaml on port 8019 (not 8000: a dev server may hold that, and talking to
+a stale process is a way to pass by accident), stops it, and starts it again:
+
+    first process    the number saves over HTTP and is reported back  PASS
+                     a page reload sees it                            PASS
+                     /alerts is still served by the SPA fallback      PASS
+                     exactly one line of settings.yaml changed        PASS
+                     its line endings are unchanged                   PASS
+    second process   the number survived the restart                  PASS
+                     the sentence names the number, not a setting     PASS
+                     changing it works                                PASS
+                     no country code is refused, nothing changed      PASS
+                     removing it works                                PASS
+    third process    the removal survived that restart too            PASS
+    afterwards       settings.yaml byte-identical to how it started   PASS
+
+And, through the real writer in `p5_notify_verify` section I:
+
+- a **new** blacklist alert is sent to the number saved over HTTP;
+- the number is changed and the **next** alert goes to the new one, not the old;
+- the number is removed and the next alert is **still raised and still on
+  screen** and sends nothing;
+- no response ever carries a credential -- checked by setting a key to a known
+  string and asserting that string is absent from the body.
+
+## Regression -- 3 failures, all three the documented ones
+
+    p1_verify              21/22   the documented environmental webcam failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision  14/14
+    p2_verify              33/34   the documented ocr_tworow500 calibration failure
+    p3_verify              57/57
+    p4a_verify             25/25
+    p4b_verify             74/74
+    p4c_verify             75/75
+    p4d_verify             79/81   the documented application-database failures
+    p4e_verify            128/129  the same
+    p5_verify            109/109
+    p5_notify_verify     158/158   126 before this pass
+    p5_number_live         15/15   new
+
+`web/dist` was rebuilt and the bundle assertions re-run against it.
+
+**One check in `p5_verify` was edited, and it is worth saying which.** It
+asserted the bundle contains "is re-read whenever it changes" -- the sentence
+naming the blacklist file, which this pass was asked to remove. What the check
+is for has not changed: the screen still has to say that an edit needs no
+restart, and the needle is now the sentence that says it. That is the only
+verification text changed in this pass, and no check was relaxed to admit
+anything.
+
+## What is still not done
+
+- **Delivery is still not confirmed.** A 2xx means the gateway accepted the
+  message for the device. Whether the SIM sent it is not read back.
+- **One number, not a list.** Unchanged, and deliberate.
+- **Credentials stay environment-only**, by design. A deployment with no key set
+  says "SMS sending is not set up on this server" on screen and names the
+  missing variable in the log.
+- **No browser rendered the new panel in this pass.** There is no headless
+  browser in `web/node_modules` and adding one is forbidden, so the UI is
+  verified through the built bundle and the HTTP routes rather than through a
+  screenshot.
+

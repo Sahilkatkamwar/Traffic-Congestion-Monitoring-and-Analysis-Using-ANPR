@@ -53,6 +53,9 @@ reading it has to be able to disagree with it.
 """
 
 import json
+import os
+import tempfile
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -295,6 +298,217 @@ def _short(item):
     return text if len(text) <= 60 else text[:57] + "..."
 
 
+# -------------------------------------------------------- editing the file
+
+# The file stays the source of truth. The Alerts screen edits it the way a
+# person with an editor would -- read it, change the `plates:` list, write it
+# back -- so nothing new becomes authoritative and the hot reload above needs
+# no change at all: a write bumps the mtime, and the writer's next sighting
+# re-reads it.
+#
+# Three properties this has to hold, and each one is a decision:
+#
+# **The comments survive.** Everything above the `plates:` key is kept byte for
+# byte, because that header is where the file explains itself and losing it on
+# the first UI edit would be losing documentation the user is meant to read.
+#
+# **Lines the loader could not use are kept.** The rewrite is built from the
+# RAW parsed list, not from `Blacklist.entries`, so an entry with a misspelled
+# severity is still in the file after an unrelated add. Dropping somebody's
+# typo silently is how a blacklist quietly loses a plate.
+#
+# **A file that does not parse is not overwritten.** There is nothing safe to
+# merge into, so the edit is refused with the parse error rather than
+# clobbering whatever is in there.
+
+_EDIT_LOCK = threading.Lock()
+
+_NEW_FILE_HEADER = """\
+# Registrations to raise an alert on the moment they are seen.
+#
+# Managed from the Alerts screen, and equally a file you can edit by hand -- it
+# is re-read whenever it changes, with nothing to restart.
+"""
+
+
+class BlacklistEditError(Exception):
+    """A refusal written for whoever is reading it on the screen."""
+
+
+def _scalar(value):
+    """One value as YAML. JSON is valid YAML for the types stored here."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _dump_plates(items):
+    if not items:
+        return "plates: []\n"
+    lines = ["plates:"]
+    for item in items:
+        if isinstance(item, dict):
+            keys = ["plate"] + [k for k in item if k != "plate"]
+            first = True
+            for key in keys:
+                if key not in item:
+                    continue
+                value = item[key]
+                # A normalised plate is A-Z0-9 and needs no quoting; it reads
+                # better unquoted in a file a person also edits by hand.
+                shown = (
+                    value
+                    if key == "plate" and isinstance(value, str) and value.isalnum()
+                    else _scalar(value)
+                )
+                lines.append(f"{'  - ' if first else '    '}{key}: {shown}")
+                first = False
+            if first:  # an empty mapping, kept rather than dropped
+                lines.append("  - {}")
+        elif isinstance(item, str):
+            # normalize() leaves A-Z0-9 only, so a bare plate needs no quoting.
+            # Anything else came from the file and is quoted to be safe.
+            lines.append(f"  - {item if item.isalnum() else _scalar(item)}")
+        else:
+            lines.append(f"  - {_scalar(item)}")
+    return "\n".join(lines) + "\n"
+
+
+def _read_for_edit(path):
+    """(header text, raw plates list). Raises BlacklistEditError if unusable."""
+    if not path.exists():
+        return _NEW_FILE_HEADER + "\n", []
+
+    text = path.read_text(encoding="utf-8")
+    try:
+        parsed = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise BlacklistEditError(
+            f"{path.name} does not parse as YAML ({exc}), so it cannot be "
+            f"edited safely. Fix the file and save it -- it is re-read "
+            f"automatically."
+        ) from exc
+
+    if isinstance(parsed, dict):
+        listed = parsed.get("plates")
+        if listed is None:
+            listed = []
+    elif isinstance(parsed, list):
+        listed = parsed
+    else:
+        raise BlacklistEditError(
+            f"{path.name} should hold a `plates:` list. Found "
+            f"{type(parsed).__name__}."
+        )
+    if not isinstance(listed, list):
+        raise BlacklistEditError(
+            f"`plates:` in {path.name} should be a list of registrations, one "
+            f"per line."
+        )
+
+    header = []
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith("plates:") and not line.startswith(" "):
+            break
+        header.append(line)
+    kept = "".join(header)
+    if kept and not kept.endswith("\n"):
+        kept += "\n"
+    return kept, list(listed)
+
+
+def _write(path, header, items):
+    """Replace the file atomically, so a reader never sees half of it.
+
+    A temporary file in the same directory and then os.replace: on Windows that
+    is the only rename that overwrites, and it is what stops the writer thread
+    stat-ing a file that is mid-write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", newline="\n", dir=str(path.parent),
+        prefix=path.name + ".", suffix=".tmp", delete=False,
+    )
+    try:
+        with handle:
+            handle.write(header + _dump_plates(items))
+        os.replace(handle.name, path)
+    except OSError:
+        Path(handle.name).unlink(missing_ok=True)
+        raise
+
+
+def _plate_of(item):
+    if isinstance(item, str):
+        return normalize(item)
+    if isinstance(item, dict):
+        return normalize(str(item.get("plate") or ""))
+    return ""
+
+
+def add_plate(plate, reason=None, severity="critical", path=None):
+    """Put one registration on the blacklist. Returns the entry as stored.
+
+    The same validation the loader applies, applied before the write rather
+    than after it: a line the loader would skip is refused here with the reason,
+    so the screen can say what is wrong instead of accepting an entry that then
+    quietly does nothing.
+    """
+    path = Path(path) if path is not None else config.blacklist_path()
+
+    text = normalize(plate)
+    if not text:
+        raise BlacklistEditError(
+            "A blacklist entry needs a registration. Type the plate, for "
+            "example MH15JS4241."
+        )
+    if len(text) < 4:
+        raise BlacklistEditError(f"{text} is too short to be a registration.")
+
+    severity = str(severity or "critical").lower()
+    if severity not in SEVERITIES:
+        raise BlacklistEditError(
+            f"{severity} is not a severity. Use one of {', '.join(SEVERITIES)}."
+        )
+    reason = None if reason is None else str(reason).strip() or None
+
+    with _EDIT_LOCK:
+        header, items = _read_for_edit(path)
+        if any(_plate_of(item) == text for item in items):
+            raise BlacklistEditError(
+                f"{text} is already on the blacklist. Remove it first if you "
+                f"want to change its reason or severity."
+            )
+        entry = {"plate": text}
+        if reason:
+            entry["reason"] = reason
+        if severity != "critical":
+            entry["severity"] = severity
+        # A bare string when there is nothing else to say, so a hand-edited
+        # file and a UI-edited one look the same.
+        items.append(text if len(entry) == 1 else entry)
+        _write(path, header, items)
+
+    print(f"[alerts] blacklist: added {text}")
+    return {"plate": text, "reason": reason, "severity": severity}
+
+
+def remove_plate(plate, path=None):
+    """Take one registration off the blacklist. Returns what was removed."""
+    path = Path(path) if path is not None else config.blacklist_path()
+    text = normalize(plate)
+    if not text:
+        raise BlacklistEditError("Which registration should be removed?")
+
+    with _EDIT_LOCK:
+        header, items = _read_for_edit(path)
+        kept = [item for item in items if _plate_of(item) != text]
+        if len(kept) == len(items):
+            raise BlacklistEditError(f"{text} is not on the blacklist.")
+        _write(path, header, kept)
+
+    print(f"[alerts] blacklist: removed {text}")
+    return {"plate": text, "removed": len(items) - len(kept)}
+
+
 # ---------------------------------------------------------------- the checks
 
 
@@ -352,6 +566,12 @@ def blacklist_hit(conn, sighting, blacklist, sources=None):
         "sighting_ids": [sighting["sighting_id"]],
         "detail": detail,
         "created_ts": utc_now(),
+        # Not a column and never written to the alerts table -- the schema is
+        # frozen at seven fields. It travels on the dict so `evaluate` can put
+        # it on the row it returns, because the SMS the control room gets has
+        # to say WHY the plate is watched and `detail` is a sentence rather
+        # than a field.
+        "reason": entry["reason"],
     }
 
 
@@ -574,6 +794,11 @@ def evaluate(conn, sighting, blacklist, sources=None):
     for alert in found:
         row = record(conn, alert)
         if row is not None:
+            # Carried, not stored: `record` writes the seven frozen columns and
+            # nothing else. A caller that wants the blacklist reason gets it
+            # here, on the row it was already given.
+            if alert.get("reason") is not None:
+                row["reason"] = alert["reason"]
             print(f"[alerts] {row['severity']}: {row['detail']}")
             stored.append(row)
     return stored

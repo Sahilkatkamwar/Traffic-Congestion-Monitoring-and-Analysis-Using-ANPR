@@ -665,31 +665,92 @@ class AnalysisJobs:
     # ------------------------------------------------------------- lifecycle
 
     def start(self, sweep=True):
-        if sweep:
-            self._sweep()
+        # What is left over is listed here and deleted on a thread of its own.
+        # `start` runs inside the FastAPI lifespan, and a delete on Windows can
+        # block forever rather than fail -- one wedged crop file left by a
+        # killed run is enough -- which stops the whole app at "Waiting for
+        # application startup". Listing first keeps the meaning of the sweep
+        # unchanged: only directories that existed before this run are ever
+        # removed, so a job submitted a moment later cannot be swept out from
+        # under itself.
+        stale = self._stale_dirs() if sweep else []
         self.thread = threading.Thread(
             target=self._run_loop, name="analyze", daemon=True
         )
         self.thread.start()
+        if stale:
+            threading.Thread(
+                target=self._sweep, args=(stale,), name="analyze-sweep", daemon=True
+            ).start()
 
-    def _sweep(self):
+    def _attempted_path(self):
+        return config.analyze_dir() / ".sweep-attempted"
+
+    def _read_attempted(self):
+        path = self._attempted_path()
+        if not path.exists():
+            return []
+        try:
+            with path.open(encoding="utf-8") as f:
+                return [line.strip() for line in f if line.strip()]
+        except OSError:
+            return []
+
+    def _write_attempted(self, names):
+        path = self._attempted_path()
+        try:
+            if names:
+                with path.open("w", encoding="utf-8") as f:
+                    f.write('\n'.join(names) + '\n')
+            elif path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+    def _stale_dirs(self):
+        """The job directories a previous run left, minus the ones that will not go.
+
+        A delete that hangs cannot report that it hung -- the call never
+        returns -- so the name is written down before the attempt rather than
+        after it. A directory still here on the next start, with its name
+        already on the list, is one this machine cannot delete; trying again
+        would wedge another thread on every start, and a process with a wedged
+        thread cannot exit even after the server shuts down cleanly.
+        """
+        root = config.analyze_dir()
+        if not root.exists():
+            return []
+        dirs = [path for path in root.iterdir() if path.is_dir()]
+        attempted = set(self._read_attempted())
+        skipped = [p for p in dirs if p.name in attempted]
+        for path in skipped:
+            print(f"[analyze] leaving {path} alone -- a previous run could not delete "
+                  f"it. Nothing here reads it; delete it by hand when the machine "
+                  f"lets go of it.")
+        return [p for p in dirs if p.name not in attempted]
+
+    def _sweep(self, stale):
         """Remove job directories left by a previous run.
 
         Jobs live in memory, so after a restart every directory under here is
         orphaned: there is no job to open it from and nothing will ever delete
         it. Sweeping is the only thing that keeps this from growing forever.
         """
-        root = config.analyze_dir()
-        if not root.exists():
-            return
-        removed = 0
-        for path in root.iterdir():
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-                removed += 1
+        attempted = self._read_attempted()
+        self._write_attempted(attempted + [p.name for p in stale])
+        removed = []
+        for path in stale:
+            shutil.rmtree(path, ignore_errors=True)
+            if path.exists():
+                print(f"[analyze] could not remove {path} -- something still holds a "
+                      f"file in it. Delete it by hand once nothing does.")
+                continue
+            removed.append(path.name)
         if removed:
-            print(f"[analyze] swept {removed} job director{'y' if removed == 1 else 'ies'} "
-                  f"left by a previous run")
+            still = [n for n in self._read_attempted() if n not in removed]
+            self._write_attempted(still)
+            print(f"[analyze] swept {len(removed)} job "
+                  f"director{'y' if len(removed) == 1 else 'ies'} left by a previous run")
 
     def shutdown(self):
         self.stopping = True
