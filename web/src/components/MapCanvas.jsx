@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import { markerIcon, markerPopup } from './CameraMarker'
+import { hereIcon, markerIcon, markerPopup } from './CameraMarker'
 
 // Leaflet directly, driven from an effect. Leaflet owns the DOM node and React
 // never touches it -- the two only meet through the marker table below.
@@ -23,10 +23,29 @@ export const ATTRIBUTION =
 const FALLBACK_CENTRE = [22.35, 78.9]
 const FALLBACK_ZOOM = 5
 
-export default function MapCanvas({ sources, activeSourceIds, onSelectSource }) {
+// P9's follow trail. Plate yellow, because the accent means "this is the thing
+// you asked about" everywhere else on the screen, and dashed so it never reads
+// as a road.
+const TRAIL_STYLE = {
+  color: 'var(--plate-yellow)',
+  weight: 3,
+  opacity: 0.9,
+  dashArray: '2 7',
+  lineCap: 'round',
+}
+
+export default function MapCanvas({
+  sources,
+  activeSourceIds,
+  onSelectSource,
+  here = null,
+  trails = [],
+}) {
   const containerRef = useRef(null)
   const mapRef = useRef(null)
   const markersRef = useRef(new Map())
+  const hereRef = useRef(null)
+  const trailsRef = useRef(new Map())
   const fittedRef = useRef(false)
 
   useEffect(() => {
@@ -98,6 +117,73 @@ export default function MapCanvas({ sources, activeSourceIds, onSelectSource }) 
       )
     }
   }, [sources, activeSourceIds, onSelectSource])
+
+  // P9. Where the browser says the person looking at this is. A convenience on
+  // the map and nothing else: it is never written down, never attached to a
+  // sighting, and never a camera's placement -- a camera is placed by being
+  // put somewhere on purpose, not by whoever happened to open the screen.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    if (!here) {
+      // Permission was refused or withdrawn. The map is exactly what it was.
+      hereRef.current?.remove()
+      hereRef.current = null
+      return
+    }
+    if (!hereRef.current) {
+      hereRef.current = L.marker([here.lat, here.lon], {
+        icon: hereIcon(),
+        keyboard: false,
+        title: 'Your location, from this browser',
+        zIndexOffset: -100,
+      }).addTo(map)
+      hereRef.current.bindPopup(
+        '<div style="font-family:var(--font-sans);color:var(--ink-hi)">' +
+          '<div style="font-weight:600">You are here</div>' +
+          '<div style="color:var(--ink-mid);font-size:12px;max-width:26ch">' +
+          'From this browser. It is not a camera and nothing is recorded here.' +
+          '</div></div>',
+      )
+    } else {
+      hereRef.current.setLatLng([here.lat, here.lon])
+    }
+  }, [here])
+
+  // P9. One line per follow session, through the cameras that vehicle has been
+  // seen at, in the order it was seen. A session watching one camera has one
+  // point and draws nothing -- a line needs somewhere to have gone.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const seen = new Set()
+
+    for (const trail of trails) {
+      const points = (trail.points || []).filter(
+        (point) => point && point[0] != null && point[1] != null,
+      )
+      seen.add(trail.follow_id)
+      let line = trailsRef.current.get(trail.follow_id)
+      if (points.length < 2) {
+        line?.remove()
+        trailsRef.current.delete(trail.follow_id)
+        continue
+      }
+      if (!line) {
+        line = L.polyline(points, TRAIL_STYLE).addTo(map)
+        trailsRef.current.set(trail.follow_id, line)
+      } else {
+        line.setLatLngs(points)
+      }
+    }
+
+    for (const [id, line] of trailsRef.current) {
+      if (!seen.has(id)) {
+        line.remove()
+        trailsRef.current.delete(id)
+      }
+    }
+  }, [trails])
 
   return <div ref={containerRef} className="absolute inset-0" aria-label="Source map" />
 }

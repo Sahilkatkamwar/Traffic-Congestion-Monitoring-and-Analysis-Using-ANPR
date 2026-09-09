@@ -52,3 +52,24 @@ export function markerPopup(source) {
       ${error}
     </div>`
 }
+
+// P9. Where the browser says the person looking at the map is. Deliberately
+// unlike a source marker: a hollow ring in the ink colour rather than a filled
+// status dot in a plate colour, because colour on this screen means status of a
+// camera and this is not a camera. It carries no status, never pulses, and is
+// not clickable in the way a source is.
+export function hereIcon() {
+  return L.divIcon({
+    className: '',
+    iconSize: [16, 16],
+    iconAnchor: [8, 8],
+    popupAnchor: [0, -10],
+    html: `
+      <span style="position:relative;display:block;width:16px;height:16px" title="Your location">
+        <span style="position:absolute;inset:0;border-radius:999px;
+                     border:2px solid var(--ink-hi);background:rgba(15,19,25,.35);
+                     box-shadow:0 0 0 2px rgba(15,19,25,.75)"></span>
+        <span style="position:absolute;inset:5px;border-radius:999px;background:var(--ink-hi)"></span>
+      </span>`,
+  })
+}

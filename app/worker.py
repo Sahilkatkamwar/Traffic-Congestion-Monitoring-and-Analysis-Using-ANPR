@@ -417,6 +417,45 @@ def _draw_overlay(frame, detections, tracks, pad_char, aliases=None):
     return canvas
 
 
+def _overlay_boxes(frame, detections, tracks, pad_char, aliases=None):
+    """The same boxes `_draw_overlay` just drew, as fractions of the frame. P9.
+
+    The wall is JPEG, so a box drawn into the pixels is not something a browser
+    can click. This is that box as four numbers, published beside the frame it
+    belongs to, and it carries the identity that was drawn on it -- the
+    stitched id, not the tracker's -- so a click reaches the row the sighting
+    will be written under.
+
+    Fractions rather than pixels because the preview is downscaled to
+    PREVIEW_MAX_WIDTH before it is sent and the tile then fits it to whatever
+    the browser gave it. A fraction survives both; a pixel survives neither.
+
+    In memory, on the preview queue. No table, no column, no file.
+    """
+    height, width = frame.shape[:2]
+    if not width or not height:
+        return []
+    boxes = []
+    for detection in detections:
+        x1, y1, x2, y2 = (float(v) for v in detection["box"])
+        tid = (aliases or {}).get(detection["track_id"], detection["track_id"])
+        track = tracks.get(tid)
+        boxes.append(
+            {
+                "track_id": int(tid),
+                "x": round(max(0.0, x1 / width), 5),
+                "y": round(max(0.0, y1 / height), 5),
+                "w": round(min(1.0, (x2 - x1) / width), 5),
+                "h": round(min(1.0, (y2 - y1) / height), 5),
+                "vehicle_type": (
+                    track.vehicle_type() if track else detection["vehicle_type"]
+                ),
+                "plate": track.live_read(pad_char) if track is not None else None,
+            }
+        )
+    return boxes
+
+
 def _encode_preview(canvas, max_width=PREVIEW_MAX_WIDTH):
     """One annotated frame as jpeg bytes, or None if it will not encode."""
     height, width = canvas.shape[:2]
@@ -987,6 +1026,12 @@ def run_worker(source, queue, stop_event, preview_queue=None, preview_on=None):
                         _draw_overlay(frame, detections, tracks, pad_char, aliases)
                     )
                     if jpeg is not None:
+                        # The same boxes as numbers, so the wall can be clicked
+                        # as well as watched. Computed from the frame that was
+                        # just drawn on, never from a second pass over it.
+                        boxes = _overlay_boxes(
+                            frame, detections, tracks, pad_char, aliases
+                        )
                         rate = fps
                         if not is_recorded and len(grab_times) > 1:
                             span = grab_times[-1] - grab_times[0]
@@ -998,6 +1043,7 @@ def run_worker(source, queue, stop_event, preview_queue=None, preview_on=None):
                                     "jpeg": jpeg,
                                     "fps": rate,
                                     "tracks": len(detections),
+                                    "boxes": boxes,
                                     "ts": db.to_iso(ts),
                                 }
                             )

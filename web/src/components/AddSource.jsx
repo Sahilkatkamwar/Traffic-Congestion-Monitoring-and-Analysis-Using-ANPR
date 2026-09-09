@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import Modal from './Modal'
 import MapPicker from './MapPicker'
+import ConnectionTest from './ConnectionTest'
 import { Button, Field, Input, Radio, Select } from './Field'
 import {
   createSource,
@@ -414,51 +415,7 @@ function LiveFlow({ uri, setUri, name, setName, devices, devicesError, onRescan,
         />
       </Field>
 
-      <div className="rounded-card bg-surface-2/60 p-3.5">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <p className="text-[13.5px] font-semibold">Test the connection</p>
-            <p className="mt-0.5 text-[12.5px] text-ink-mid">
-              A live camera is only worth saving once it has sent a frame.
-            </p>
-          </div>
-          <Button onClick={onTest} disabled={!uri.trim() || testing}>
-            {testing ? 'Testing…' : 'Test'}
-          </Button>
-        </div>
-
-        {tested && (
-          <div className="mt-3">
-            {tested.ok ? (
-              <div className="flex gap-3">
-                {tested.preview && (
-                  <img
-                    src={tested.preview}
-                    alt="Frame from the camera being tested"
-                    className="h-[86px] w-[152px] shrink-0 rounded-control bg-surface-3 object-cover"
-                  />
-                )}
-                <div className="min-w-0 text-[12.5px]">
-                  <p className="font-semibold text-plate-green">Connected.</p>
-                  <p className="mt-1 tabular-nums text-ink-mid">
-                    {tested.width}×{tested.height}
-                    {tested.fps ? ` · ${tested.fps.toFixed(1)} fps` : ''}
-                    {tested.fps_measured ? ' (measured)' : ''}
-                  </p>
-                  {tested.recorded && (
-                    <p className="mt-1 text-plate-yellow">
-                      This is a recorded file, not a live camera. It will be timestamped
-                      from its start time — add it as a recorded video instead.
-                    </p>
-                  )}
-                </div>
-              </div>
-            ) : (
-              <p className="text-[12.5px] text-plate-red">{tested.error}</p>
-            )}
-          </div>
-        )}
-      </div>
+      <ConnectionTest uri={uri} tested={tested} testing={testing} onTest={onTest} />
     </div>
   )
 }

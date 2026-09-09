@@ -17,7 +17,17 @@ function Field({ label, children }) {
   )
 }
 
-export default function EvidencePanel({ sighting, sourceName, onClose, onTrace }) {
+export default function EvidencePanel({
+  sighting,
+  sourceName,
+  onClose,
+  onTrace,
+  // P9's Follow. Optional: the panel is opened from Trace and from the camera
+  // wall too, and neither of those is a live screen with a socket to follow on.
+  following = false,
+  onFollow = null,
+  onUnfollow = null,
+}) {
   const reduced = useReducedMotion()
 
   useEffect(() => {
@@ -137,18 +147,42 @@ export default function EvidencePanel({ sighting, sourceName, onClose, onTrace }
 
             <div className="hairline-t mt-5 flex items-center justify-between gap-3 px-5 py-4">
               <p className="text-[12px] text-ink-low">
-                {sighting.plate_text
-                  ? 'Matching is fuzzy, so tracing returns ranked candidates rather than one answer.'
-                  : 'This vehicle has no plate read, so there is nothing to trace it by.'}
+                {!sighting.plate_text
+                  ? 'This vehicle has no plate read, so there is nothing to trace or follow it by.'
+                  : following
+                  ? 'Following. The map draws this vehicle in as it is seen again.'
+                  : 'Matching is fuzzy, so tracing returns ranked candidates rather than one answer.'}
               </p>
-              <button
-                type="button"
-                disabled={!sighting.plate_text}
-                onClick={() => onTrace?.(sighting.plate_text)}
-                className="shrink-0 rounded-control bg-plate-yellow px-3.5 py-2 text-[13px] font-semibold text-[#1a1400] transition-transform duration-150 hover:brightness-105 active:scale-[.98] disabled:cursor-not-allowed disabled:bg-surface-3 disabled:text-ink-low"
-              >
-                Trace this vehicle
-              </button>
+              <div className="flex shrink-0 items-center gap-2">
+                {/* Follow is live and Trace is history, which is why they are
+                    two buttons and not one control with a mode. Follow only
+                    appears where there is a socket to follow on. */}
+                {onFollow && (
+                  <button
+                    type="button"
+                    disabled={!sighting.plate_text}
+                    aria-pressed={following}
+                    onClick={() =>
+                      following ? onUnfollow?.(sighting) : onFollow(sighting)
+                    }
+                    className={`rounded-control px-3.5 py-2 text-[13px] font-semibold transition-transform duration-150 active:scale-[.98] disabled:cursor-not-allowed disabled:bg-surface-3 disabled:text-ink-low ${
+                      following
+                        ? 'bg-plate-green/25 text-ink-hi'
+                        : 'bg-surface-2 text-ink-hi hover:bg-surface-3'
+                    }`}
+                  >
+                    {following ? 'Stop following' : 'Follow'}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={!sighting.plate_text}
+                  onClick={() => onTrace?.(sighting.plate_text)}
+                  className="rounded-control bg-plate-yellow px-3.5 py-2 text-[13px] font-semibold text-[#1a1400] transition-transform duration-150 hover:brightness-105 active:scale-[.98] disabled:cursor-not-allowed disabled:bg-surface-3 disabled:text-ink-low"
+                >
+                  Trace this vehicle
+                </button>
+              </div>
             </div>
           </motion.div>
         </motion.div>

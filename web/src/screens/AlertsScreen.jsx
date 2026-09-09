@@ -10,7 +10,9 @@ import {
   getAlerts,
   getBlacklist,
   getNotifications,
+  getTestNotification,
   removeBlacklistPlate,
+  sendTestNotification,
   setControlRoomNumber,
 } from '../lib/api'
 import { openLiveFeed } from '../lib/socket'
@@ -272,6 +274,12 @@ function ControlRoom({ status, onChanged }) {
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState(null)
   const [saidOk, setSaidOk] = useState(null)
+  // The manual test, as the server last described it. The send happens on the
+  // server's own thread -- the same one an alert goes out on -- so the POST
+  // answers with a record that says `sending`, and this polls it until it
+  // says how it ended. Nothing here waits on the network.
+  const [test, setTest] = useState(null)
+  const sending = test?.status === 'sending'
 
   // The field follows the server whenever the saved number changes underneath
   // it -- a reload, or another tab -- but never while it is being typed into.
@@ -282,6 +290,50 @@ function ControlRoom({ status, onChanged }) {
       setNumber(saved)
     }
   }, [saved])
+
+  const watching = sending ? test.test_id : null
+  useEffect(() => {
+    if (watching === null) return undefined
+    let live = true
+    // Three attempts with a backoff take a carrier a good half minute. Past
+    // that the honest thing is to stop asking and say so, rather than spin on
+    // an answer that may never come.
+    const giveUp = Date.now() + 60000
+    const timer = setInterval(async () => {
+      if (Date.now() > giveUp) {
+        setTest((current) =>
+          current && current.test_id === watching
+            ? {
+                ...current,
+                status: 'unknown',
+                detail:
+                  'it has not reported back within a minute. The log has the outcome.',
+              }
+            : current,
+        )
+        return
+      }
+      try {
+        const next = await getTestNotification(watching)
+        if (!live) return
+        onChanged(next)
+        setTest(next.test)
+      } catch (failure) {
+        if (!live) return
+        // The message may well have gone out -- what failed is this browser
+        // asking about it -- so it says exactly that rather than "failed".
+        setTest((current) =>
+          current && current.test_id === watching
+            ? { ...current, status: 'unknown', detail: failure.message }
+            : current,
+        )
+      }
+    }, 700)
+    return () => {
+      live = false
+      clearInterval(timer)
+    }
+  }, [watching, onChanged])
 
   if (!status) return null
   const { police_number: number_in_use, ready, reason, sent, failed, last } = status
@@ -302,6 +354,25 @@ function ControlRoom({ status, onChanged }) {
           ? `Saved. New blacklist alerts go to ${next.police_number}.`
           : `Saved ${next.police_number}.`,
       )
+    } catch (failure) {
+      setError(failure.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  // One real message, to the saved number, with no vehicle involved. It is the
+  // only way to find out whether the control room's phone actually receives
+  // these without waiting for a blacklisted plate to drive past.
+  const sendTest = async () => {
+    setError(null)
+    setSaidOk(null)
+    setTest(null)
+    setBusy('test')
+    try {
+      const next = await sendTestNotification()
+      onChanged(next)
+      setTest(next.test)
     } catch (failure) {
       setError(failure.message)
     } finally {
@@ -391,6 +462,42 @@ function ControlRoom({ status, onChanged }) {
           </p>
         )}
       </form>
+
+      {saved && (
+        <div className="hairline-t mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 pt-3">
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={sendTest}
+            disabled={busy !== null || sending}
+          >
+            {busy === 'test' || sending ? 'Sending…' : 'Send test alert'}
+          </Button>
+          <p className="text-[12px] text-ink-low">
+            One message to {number_in_use || 'the saved number'}, to check it
+            arrives. No vehicle involved, and nothing is added to the alerts
+            below.
+          </p>
+        </div>
+      )}
+
+      {test && test.status === 'sent' && (
+        <p className="mt-2 text-[12.5px] text-plate-green" role="status">
+          Test message sent to {test.to}
+          {test.attempts > 1 ? ` on attempt ${test.attempts}` : ''}. If it does
+          not arrive, the phone sending it is the next thing to check.
+        </p>
+      )}
+      {test && test.status === 'failed' && (
+        <p className="mt-2 text-[12.5px] text-plate-red" role="alert">
+          The test message did not go out: {test.detail}
+        </p>
+      )}
+      {test && test.status === 'unknown' && (
+        <p className="mt-2 text-[12.5px] text-ink-mid" role="status">
+          The test was sent, but this page could not confirm it: {test.detail}
+        </p>
+      )}
 
       <p className="hairline-t mt-3 pt-3 text-[12px] text-ink-low">
         One SMS per new blacklist alert — never for an alert already raised, and

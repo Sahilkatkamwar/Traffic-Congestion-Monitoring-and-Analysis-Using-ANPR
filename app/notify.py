@@ -25,6 +25,17 @@ cost of being wrong is a control room's phone at 3 a.m.
 way a message is sent is a sighting committing now and raising an alert now.
 Turning the feature on does not notify anybody about yesterday.
 
+## The manual test
+
+`send_test()` sends one message because somebody pressed a button, not because
+anything was seen. It is the same queue, the same daemon thread, the same
+retries and the same number -- the point of it is to prove that path reaches
+the phone, so a second path would prove nothing. Two things keep it apart from
+a real alert: it is tagged `manual_test` in the job, in the log line and in
+what the API returns, and its text says on its first line that it is not an
+alert. It raises nothing, writes no row, and never touches `_last`, so the
+"last notification" the Alerts screen reports still means the last *alert*.
+
 ## The number is set from the screen; credentials never are
 
 `config/settings.yaml` carries the control-room number and which provider to
@@ -89,6 +100,16 @@ USER_AGENT = "anpr-city/1.0"
 PROVIDERS = ("textbee", "console", "none")
 
 SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
+
+# What a queued message is for. The alert kind is the same word app/alerts.py
+# writes into the alerts table, so a log line reads the same on both sides;
+# `manual_test` is not a kind of alert and never reaches that table.
+KIND_ALERT = "blacklist"
+KIND_TEST = "manual_test"
+
+# Manual tests kept for the screen to poll. A handful is all anybody needs --
+# the button reports its own result and the log has the rest.
+TEST_HISTORY = 20
 
 # The environment variables this reads. Named here rather than inline so
 # `describe()` can tell the UI exactly which one is missing.
@@ -393,6 +414,27 @@ def compose(alert, sighting, source):
     return body[: MAX_BODY_CHARS - 1] + "…"
 
 
+def compose_test(clock=None):
+    """The text a manual test sends, and it must not read like an alert.
+
+    The phone this arrives on is the phone the real thing arrives on, so the
+    first line says what it is before anybody has finished reading. There is no
+    plate, no camera and no sighting time in it because there is no sighting --
+    a test carrying a plate is a test somebody acts on.
+
+    Nothing here is composed from the database. It is one fixed statement plus
+    the clock, which is the only thing about a test that varies.
+    """
+    return "\n".join(
+        [
+            "ANPR TEST: this is not a real alert.",
+            "Sent from the Alerts screen to check this number receives messages.",
+            "No vehicle was seen and no alert was raised.",
+            f"Time: {_clock(clock or utc_now())}",
+        ]
+    )
+
+
 # ----------------------------------------------------------------- providers
 
 
@@ -518,7 +560,11 @@ class Notifier:
         self._sent = 0
         self._failed = 0
         self._skipped = 0
-        self._last = None           # the last outcome, for the UI
+        self._last = None           # the last ALERT outcome, for the UI
+        self._tests = []            # manual tests, oldest first, capped
+        self._test_seq = 0
+        self._test_sent = 0
+        self._test_failed = 0
 
     # -- configuration ------------------------------------------------------
 
@@ -599,6 +645,12 @@ class Notifier:
             "failed": self._failed,
             "skipped": self._skipped,
             "last": dict(self._last) if self._last else None,
+            # Manual tests are counted apart from alerts on purpose. "3 sent
+            # this run" on the Alerts screen has to mean three alerts went out,
+            # and a button somebody pressed twice must not be able to say it.
+            "test_sent": self._test_sent,
+            "test_failed": self._test_failed,
+            "last_test": dict(self._tests[-1]) if self._tests else None,
             "env": {
                 "api_key": ENV_API_KEY,
                 "device_id": ENV_DEVICE,
@@ -653,8 +705,124 @@ class Notifier:
         number, _ = clean_number(police_number())
         body = compose(alert, sighting, source)
         self._start()
-        self._queue.put({"alert_id": alert_id, "to": number, "body": body})
+        self._queue.put(
+            {
+                "kind": KIND_ALERT,
+                "test_id": None,
+                "alert_id": alert_id,
+                "to": number,
+                "body": body,
+            }
+        )
         return True
+
+    def send_test(self, clock=None):
+        """Send one message because somebody pressed a button. Never raises.
+
+        Returns the record to watch: a dict with a `test_id`, a `status` of
+        `sending` / `sent` / `failed` / `refused`, and -- once it is finished --
+        either the gateway's reference or the reason it did not go. The screen
+        polls that record rather than waiting on the response, because the
+        network is on the daemon thread here exactly as it is for an alert.
+
+        What it does NOT do matters as much as what it does. It writes no
+        alert, reads no sighting and consults no blacklist: there is nothing to
+        match and nothing to record, which is the whole point of being able to
+        press it on a quiet system. It is also not gated on `min_severity` --
+        that floor decides which alerts are worth waking somebody for, and a
+        person pressing this button has already decided. Everything else that
+        would stop a real alert going out stops this too, through the same
+        `readiness()`, so a test that arrives proves an alert would.
+        """
+        with self._lock:
+            live = next(
+                (row for row in reversed(self._tests) if row["status"] == "sending"),
+                None,
+            )
+            if live is not None:
+                # A double click, or two screens open. Hand back the message
+                # already in flight rather than sending a second one -- these
+                # cost the sending SIM real money and a control room a real
+                # interruption.
+                return dict(live)
+            self._test_seq += 1
+            test_id = self._test_seq
+
+        ready, reason, detail = self.readiness()
+        if not ready:
+            print(
+                f"[notify] manual test {test_id} not sent: {reason}"
+                + (f" ({detail})" if detail else "")
+            )
+            return self._remember(
+                {
+                    "test_id": test_id,
+                    "kind": KIND_TEST,
+                    "status": "refused",
+                    "ok": False,
+                    "to": None,
+                    "detail": reason,
+                    "reference": None,
+                    "attempts": 0,
+                    "created_ts": utc_now(),
+                    "finished_ts": utc_now(),
+                }
+            )
+
+        number, _ = clean_number(police_number())
+        record = self._remember(
+            {
+                "test_id": test_id,
+                "kind": KIND_TEST,
+                "status": "sending",
+                "ok": None,
+                "to": number,
+                "detail": None,
+                "reference": None,
+                "attempts": 0,
+                "created_ts": utc_now(),
+                "finished_ts": None,
+            }
+        )
+        self._start()
+        self._queue.put(
+            {
+                "kind": KIND_TEST,
+                "test_id": test_id,
+                "alert_id": None,
+                "to": number,
+                "body": compose_test(clock),
+            }
+        )
+        return record
+
+    def test_record(self, test_id):
+        """One manual test as it now stands, or None. What the screen polls."""
+        with self._lock:
+            for row in self._tests:
+                if row["test_id"] == test_id:
+                    return dict(row)
+        return None
+
+    def _remember(self, record):
+        with self._lock:
+            self._tests.append(record)
+            del self._tests[:-TEST_HISTORY]
+            return dict(record)
+
+    def _finish_test(self, outcome):
+        with self._lock:
+            for row in self._tests:
+                if row["test_id"] == outcome.get("test_id"):
+                    row.update(
+                        status="sent" if outcome["ok"] else "failed",
+                        ok=outcome["ok"],
+                        detail=outcome.get("detail"),
+                        reference=outcome.get("reference"),
+                        attempts=outcome.get("attempts"),
+                        finished_ts=outcome["ts"],
+                    )
+                    return
 
     def _start(self):
         with self._lock:
@@ -677,6 +845,24 @@ class Notifier:
                 self._deliver(job)
             except Exception as exc:  # noqa: BLE001 - a thread that dies is silent
                 print(f"[notify] delivery crashed: {type(exc).__name__}: {exc}")
+                if job.get("kind") == KIND_TEST:
+                    # A test somebody is watching must never be left saying
+                    # `sending` forever -- the screen would poll an answer that
+                    # is never coming, and the next press would be refused as a
+                    # duplicate of a message nothing is carrying.
+                    self._record_outcome(
+                        KIND_TEST,
+                        {
+                            "ok": False,
+                            "kind": KIND_TEST,
+                            "alert_id": None,
+                            "test_id": job.get("test_id"),
+                            "to": job.get("to"),
+                            "detail": f"{type(exc).__name__}: {exc}",
+                            "attempts": ATTEMPTS,
+                            "ts": utc_now(),
+                        },
+                    )
             finally:
                 self._queue.task_done()
 
@@ -686,8 +872,21 @@ class Notifier:
         return self.console if name == "console" else _textbee
 
     def _deliver(self, job):
+        """One message, up to ATTEMPTS times. The same path for both kinds.
+
+        An alert and a manual test are delivered by identical code, because a
+        test that took a different route would prove nothing about the route an
+        alert takes. All that differs is where the outcome is counted and what
+        the log line calls it.
+        """
         name = self.provider()
         send = self._transport_for(name)
+        kind = job.get("kind", KIND_ALERT)
+        label = (
+            f"manual test {job['test_id']}"
+            if kind == KIND_TEST
+            else f"alert {job['alert_id']}"
+        )
         error = None
         for attempt in range(ATTEMPTS):
             if attempt:
@@ -697,35 +896,61 @@ class Notifier:
             except Exception as exc:  # noqa: BLE001 - reported, never raised on
                 error = f"{type(exc).__name__}: {exc}"
                 continue
-            self._sent += 1
-            self._last = {
-                "ok": True,
-                "alert_id": job["alert_id"],
-                "to": job["to"],
-                "reference": reference,
-                "attempts": attempt + 1,
-                "ts": utc_now(),
-            }
+            self._record_outcome(
+                kind,
+                {
+                    "ok": True,
+                    "kind": kind,
+                    "alert_id": job.get("alert_id"),
+                    "test_id": job.get("test_id"),
+                    "to": job["to"],
+                    "reference": reference,
+                    "attempts": attempt + 1,
+                    "ts": utc_now(),
+                },
+            )
             print(
-                f"[notify] SMS sent to {job['to']} for alert {job['alert_id']} "
+                f"[notify] SMS sent to {job['to']} for {label} "
                 f"({name}, reference {reference})"
             )
             return
-        self._failed += 1
-        self._last = {
-            "ok": False,
-            "alert_id": job["alert_id"],
-            "to": job["to"],
-            "detail": error,
-            "attempts": ATTEMPTS,
-            "ts": utc_now(),
-        }
+        self._record_outcome(
+            kind,
+            {
+                "ok": False,
+                "kind": kind,
+                "alert_id": job.get("alert_id"),
+                "test_id": job.get("test_id"),
+                "to": job["to"],
+                "detail": error,
+                "attempts": ATTEMPTS,
+                "ts": utc_now(),
+            },
+        )
         # Loud, because a control-room notification that failed is the one
         # thing in this module somebody has to know about.
-        print(
-            f"[notify] SMS FAILED after {ATTEMPTS} attempts for alert "
-            f"{job['alert_id']}: {error}"
-        )
+        print(f"[notify] SMS FAILED after {ATTEMPTS} attempts for {label}: {error}")
+
+    def _record_outcome(self, kind, outcome):
+        """Count it, and put it where whatever asked for it will look.
+
+        A manual test never becomes `_last`. That field is what the Alerts
+        screen calls "the last notification", and it has to keep meaning the
+        last alert -- a test button able to overwrite the record of a blacklist
+        message that failed would hide the one thing here that matters.
+        """
+        if kind == KIND_TEST:
+            if outcome["ok"]:
+                self._test_sent += 1
+            else:
+                self._test_failed += 1
+            self._finish_test(outcome)
+            return
+        if outcome["ok"]:
+            self._sent += 1
+        else:
+            self._failed += 1
+        self._last = outcome
 
     def drain(self, timeout=20.0):
         """Wait for the queue to empty and the last delivery to finish.

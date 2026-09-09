@@ -491,6 +491,23 @@ defaults:
   # growing cost inside the one writer.
   alert_transition_window_sec: 3600
 
+  # --- follow, P9 -----------------------------------------------------------
+  # A live watch on one vehicle, held per open browser connection and never
+  # written down. Two numbers only.
+  #
+  # How long a follow session survives with no matching sighting. 120s is the
+  # spec's default and it is an assumption, not a measurement: nothing in this
+  # repo measures how long a vehicle takes to reach a second camera, because no
+  # two cameras have been placed on one road yet. Long enough that a vehicle
+  # crossing a junction is still followed, short enough that a session nobody
+  # is watching ends by itself. The screen is told when it ends, never left
+  # showing a watch that stopped.
+  follow_timeout_seconds: 120
+  # The confidence floor a new sighting must reach to be an update for a
+  # follow. The same floor the Trace search opens on -- a follow is that same
+  # fuzzy question asked forwards in time, so it is answered at the same bar.
+  follow_min_score: 0.72
+
   # --- vehicle type classifier ----------------------------------------------
   # Only consulted when models.vehicle_classes is set. Below the floor the
   # classifier abstains and the detector's COCO label stands.

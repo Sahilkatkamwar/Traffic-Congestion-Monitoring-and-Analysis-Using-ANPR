@@ -2964,3 +2964,763 @@ the rail and both still open.
   and they hold files under `scratch/` open, so the suite cannot even be read
   from disk. It wants a reboot and one re-run, and that is the honest state of
   it rather than a number.
+
+# P7 - Alerts: manual send
+
+Second phase of PHASE2.md. Nothing about how an alert is decided moved:
+`app/alerts.py` is byte-identical, the three P0-P5 tables are the frozen
+columns they were, no table gained a field, and `app/detect.py`, `app/ocr.py`,
+`app/grammar.py`, `app/matching.py`, `app/stitch.py`, `app/worker.py` and every
+model weight were not opened.
+
+## The problem, stated as it actually was
+
+The control-room number could be saved from the Alerts screen and the screen
+would say `Sending`. What it could not say is whether anything arrives. The
+only way to find out was to wait for a blacklisted plate to drive past a
+camera, which is not a test -- it is a hope. Everything between the saved
+number and the phone in somebody's hand (the API key, the device id, the
+TextBee app being open, the SIM being in credit, the number being right) was
+unobservable until the one moment it had to work.
+
+## What was built
+
+**A `Send test alert` button** in the Control room panel, beside the saved
+number. It sends one real message, now, with no vehicle involved.
+
+**`notify.compose_test()`** -- the text it sends. Four lines, and the first one
+is `ANPR TEST: this is not a real alert.` It carries no plate, no camera, no
+location and no reason, because there is no sighting behind it; the only thing
+in it that varies is the clock. A test the control room could mistake for an
+alert is a test somebody acts on.
+
+**`Notifier.send_test()`** -- the same queue, the same daemon thread, the same
+three attempts and the same number an alert goes out on. That is the whole
+point of it: a test taking a second path would prove nothing about the path an
+alert takes. It returns a record with a `test_id` and a `status` of `sending`,
+which is what the screen polls.
+
+**Two routes.** `POST /api/notifications/test` starts one and answers with that
+record beside the usual notification status; `GET /api/notifications/test/{id}`
+says how it ended. Both are the pipeline's own notifier, not a fresh one, so
+what the screen is told is what the writer would actually do.
+
+**The button reports what happened, in the reader's words.** `Sending…` while
+it is out, then either `Test message sent to +91…` or the specific reason it
+did not go -- the carrier's own words on a refusal, `readiness()`'s sentence
+when the server cannot send at all. It is disabled for the whole of that, and
+it never says "sent" for a message the server has not confirmed.
+
+## The decisions, and what each one refuses
+
+**A manual test is tagged, never counted as an alert.** `kind: manual_test` in
+the queued job, in the log line (`for manual test 3` against `for alert 12`)
+and in the API response. `test_sent` and `test_failed` are separate counters,
+and `_last` -- what the screen calls "the last notification" -- is only ever
+written by an alert. A test button able to overwrite the record of a blacklist
+message that failed would hide the one thing in this module that matters.
+P13's History gets the same tag when it is built.
+
+**It is not gated on `min_severity`.** That floor decides which alerts are
+worth waking somebody for; a person pressing a button has already decided.
+Everything else that stops a real alert stops this too, through the same
+`readiness()` -- so a test that arrives proves an alert would.
+
+**Nothing is recorded.** No alerts row, no sighting, no blacklist entry. The
+test writes nothing to the database at all, which is what lets it be pressed on
+a system with no cameras and no footage.
+
+**A second press while one is in flight is the same test.** These cost the
+sending SIM real money and a control room a real interruption, so a double
+click or a second browser tab joins the message already going out rather than
+sending another.
+
+**The answer is a record to poll, not an outcome to wait for.** The route
+returns before the network happens, exactly as the writer does when a sighting
+commits. Nothing in the app ever waits on a carrier.
+
+## The guard that came out of the work
+
+A test left saying `sending` forever is worse than one that failed: the screen
+polls an answer that never comes, and the next press is refused as a duplicate
+of a message nothing is carrying. So a delivery that crashes outright still
+ends the record with the reason, and the browser stops asking after a minute
+and says it could not confirm rather than spinning.
+
+## Exit criteria - verified as far as this machine can
+
+PHASE2.md's exit for P7: *"clicking the button with a number saved dispatches
+one real message through the TextBee gateway and the UI reflects success or the
+specific failure reason."*
+
+`scratch/p7_verify.py` -- **97 passed, 0 failed, 0 skipped in 20s**, log in
+`scratch/p7_verify.log`. Throwaway database, throwaway blacklist, throwaway
+copy of settings.yaml, `provider: console`. **Nothing in it can reach a
+carrier** -- there is no code path from the suite to the network.
+
+| check | result |
+|---|---|
+| the test message says it is not an alert | ✅ first line, before anybody finishes reading |
+| and carries no plate, camera, location, reason or severity | ✅ each asserted absent |
+| a real alert still composes exactly as it did | ✅ and the two first lines differ |
+| one press, one message | ✅ to the saved control-room number, with the test text |
+| the record ends `sent`, with the gateway's reference | ✅ reference, attempts and finishing time |
+| tests are counted apart from alerts | ✅ `test_sent` 1, `sent` 0 |
+| "the last notification" still means the last alert | ✅ a failed test leaves a failed alert's record untouched |
+| the severity floor does not apply to it | ✅ a warning alert skipped, the test still sent |
+| no number saved | ✅ refused, with `readiness()`'s own sentence, nothing sent |
+| provider `none` | ✅ refused |
+| a refusing carrier | ✅ 3 attempts, then `failed` carrying the carrier's words |
+| a delivery that crashes | ✅ still ends the record, and frees the button |
+| the button cannot block | ✅ `send_test` returned in **0 ms** against a 1500 ms carrier |
+| a double press | ✅ one message, the same `test_id` |
+| over HTTP | ✅ POST accepted, polled to `sent`, through the pipeline's own notifier |
+| with no sighting and no alert in the database at all | ✅ 0 rows of each at that point in the run |
+| no credential is served | ✅ a key and a device id set in the environment are absent from both responses |
+| an unknown test id | ✅ 404 with a sentence saying what to do |
+| a test writes nothing | ✅ 0 new alert rows, 0 new sighting rows |
+| an alert still goes out behind a test | ✅ 2 alerts, 1 test, counted apart |
+| the frontend | ✅ both changed files parse; the bundle carries the route, the button and both result sentences |
+
+**What could not be verified here, and it is half the exit criterion.**
+`TEXTBEE_API_KEY` and `TEXTBEE_DEVICE_ID` are not set in this environment, so
+no message could be pushed through the real gateway from this session; the
+suites are forbidden from reaching the network in any case. The live half is
+the button itself: set both variables, start the app, and press **Send test
+alert** on `/alerts`. That is the same call, the same composed text and the
+same transport this suite exercised against `console` -- the only difference is
+which function the last hop calls, and that hop is the P5 code that was
+verified against the live gateway on 2026-09-04 and is unchanged by this phase.
+
+## Regression -- the documented failures, and one suite that could not run
+
+Every suite re-run against the P7 tree; logs in `scratch/p7_reg_*.log` and
+`scratch/p7_final_*.log`.
+
+    p1_verify              21/22   the documented environmental webcam failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision    --    could not run; see below
+    p2_verify              33/34   the documented ocr_tworow500 calibration failure
+    p3_verify              57/57
+    p4a_verify             25/25
+    p4b_verify             67/72   the five environmental failures P6 recorded
+    p4c_verify             75/75
+    p4d_verify             79/81   the documented application-database failures
+    p4e_verify            128/129  the same
+    p5_verify            109/109
+    p5_notify_verify     181/183   the documented settings.yaml no-op failures
+    p5_number_live         14/15   the same cause
+    p6_verify            114/114
+    p7_verify              97/97   new
+
+**`p5_verify` is unchanged at 109 of 109 and `p5_notify_verify` fails only its
+two documented checks**, which together are the statement that this phase did
+not move how an alert is decided, composed, deduplicated or dispatched. Both
+were re-run last, after every edit in this phase, along with `p7_verify`.
+
+The p2, p4b, p4d, p4e, p5_notify and p5_number_live failures all reproduce the
+counts PROGRESS.md already records for them, check for check:
+
+- **p4b's five** are the same five as the P6 run -- the recorded-video worker
+  does not reach the end of `23sec.mp4` inside the suite's window on this
+  machine, so the source is still `running` when the checks after it are made.
+  Progress reached 0.543 here against 0.568 there, and the run took 451s
+  against 448s.
+- **p2's one** is the `ocr_tworow500` confidence calibration: the highest-
+  confidence plated row in the clip is the truck with no legible plate, so the
+  check inspects it instead of the car. The same voted string as recorded.
+- **p5_notify's two and p5_number_live's one** are the same fact: both save
+  `+919960089069` over HTTP and then assert exactly one line of settings.yaml
+  changed, and the shipped file already carries that number, so zero lines do.
+
+**`p1_verify_supervision` could not be measured, and that is the honest state
+of it.** It hung at startup with no output at all -- and so did the two
+instances of it started at 23:52 and 00:19, before any of this phase's code
+existed, which is what says it is not this phase. The machine is in the state
+PROGRESS.md's P6 section describes: two `python -m app.run` processes and an
+`os.lstat` probe loop from 15:38-15:44 are still spinning, ~6.6 CPU-hours of
+CPU each and still rising, and `taskkill` reports no such task. Only the
+instance this pass started was killed, so the rest of the queue could run. It
+wants a reboot and one re-run.
+
+## Files
+
+    app/notify.py                      compose_test, send_test, test_record,
+                                       kind-aware _deliver, separate counters
+    app/api.py                         POST /api/notifications/test,
+                                       GET /api/notifications/test/{id}
+    web/src/lib/api.js                 sendTestNotification, getTestNotification
+    web/src/screens/AlertsScreen.jsx   the button, the poll, the result line
+    scratch/p7_verify.py               NEW -- 97 checks
+
+`web/dist` rebuilt.
+
+## Runnable
+
+    env\Scripts\activate.bat
+    python -m app.run
+
+Then http://127.0.0.1:8000/alerts.
+
+## What is not done, and is not pretended to be
+
+- **Delivery is still not confirmed**, exactly as in P5. A 2xx from TextBee
+  means the gateway accepted the message for the phone. Whether the SIM sent it
+  and whether it arrived is not readable by this app, which is why the success
+  line says the phone is the next thing to check.
+- **Tests are not persisted.** They live in the notifier, capped at the last
+  20, and a restart forgets them -- which is why the 404 says to send another
+  one rather than pretending to look one up. P13's History is where a test
+  becomes a record; the `manual_test` tag is already on it for that.
+- **No browser rendered the panel in this pass.** There is no headless browser
+  in `web/node_modules` and adding one is forbidden, so the button is verified
+  through the built bundle and the HTTP routes, as every phase before it was.
+- **The give-up bound is one minute of polling.** A message still in flight
+  after that is reported as unconfirmed rather than as sent or failed; the log
+  has the outcome either way.
+
+---
+
+# P8 - Sources: three phone-camera quick-add slots
+
+Third phase of PHASE2.md, and the smallest of them. Nothing about the source
+abstraction moved: `app/worker.py`, `app/sources.py`, `app/pipeline.py`,
+`app/probe.py` and `app/api.py` were not opened -- nothing under `app/` was --
+no table gained a field, no route was added or changed, and no model weight was
+touched. The phase is two
+new components and three lines of wiring in `web/src`.
+
+## The problem, stated as it actually was
+
+Adding a phone was five steps in a dialog. Open **Add source**, choose **Live
+camera**, wait out the webcam scan -- which opens five DirectShow indices in
+turn and finds nothing relevant to a phone -- paste the URL, type a name, test,
+place, save. For one camera that is fine. For the thing this project is
+actually about, three phones on a table pointed at a road, it is the same
+dialog three times, and the name field asks a question ("North gate"?) that a
+test rig does not have an answer to.
+
+The other half is what a phone shows you. IP Webcam prints
+`http://192.168.1.7:8080` on the phone's screen; the URL the stream lives at is
+that plus `/video`, and the app was silent about the difference. Typing what
+the phone says produced a source that failed with a connection error.
+
+## What was built
+
+**A Phone cameras panel** at the top of `/sources`, with exactly three slots --
+Phone 1, Phone 2, Phone 3 -- one address field each, and a Test button, a Save
+button and, once bound, a status pill and Start/Stop beside it. `n of 3
+running` is in the corner.
+
+**The address is completed, and the completion is shown.** `192.168.1.7`
+becomes `http://192.168.1.7:8080/video` and the slot says
+`Will connect to http://192.168.1.7:8080/video` before anything is tested or
+saved. Only a bare host is completed: an address that already carries a path is
+somebody else's camera app -- DroidCam's `/mjpegfeed`, a vendor's `/stream` --
+and rewriting it would be the app overruling what it was told. `rtsp://` is
+passed through untouched.
+
+**`ConnectionTest.jsx`** -- the test panel, its Test button and its preview
+frame, lifted out of `AddSource.jsx` and rendered by both. This is the part
+that makes "not a second code path" true in the code rather than in a comment:
+there is one such panel in the bundle, and the built JavaScript is asserted to
+contain its sentence exactly once.
+
+**A slot is a source id.** Phone 1 is the source `phone_1`. No column, no
+table, no browser storage: the three slots are derived from the source list the
+screen has already loaded, so they read the same in every browser, survive a
+restart, and stay bound if the source is renamed.
+
+## The decisions, and what each one refuses
+
+**A slot is convenience, not a shortcut.** It saves through the same
+`POST /api/sources/test` and `POST /api/sources` the general flow uses, with
+the same `MapPicker` and the same preview frame, and the row it writes is an
+ordinary `network` source with the configured default `frame_skip`. A worker
+started from a slot cannot be told apart from one started from the dialog,
+which is the whole point of CLAUDE.md's source abstraction and the one thing
+this phase was most able to break.
+
+**A webcam index is refused, not completed.** `0` typed into a phone field
+would become `http://0:8080/video`, which is a URL for nothing. The slot says
+what it is and where to go instead -- Add source, Live camera -- rather than
+saving a source that will fail.
+
+**Placement is optional, exactly as it is in the general flow.** `lat` and
+`lon` are nullable in the frozen schema and the Add-source dialog already saves
+without them, so a slot that demanded a map click would be a second rule for
+the same act. The slot says what an unplaced phone costs -- "still runs and
+still writes sightings, it just has no marker on the map" -- rather than
+blocking on it.
+
+**Moving the pin does not restart the camera.** A `PATCH` carrying a `uri`
+makes the API report `restart_needed`, and the slot acts on that by stopping
+and starting the worker. So a save that only changed the placement sends only
+`lat` and `lon`, and a phone that is reading fine is not interrupted to record
+where it is standing.
+
+**Deleting is still on the card below, with its confirm dialog.** A slot can
+add, re-address, start and stop; it cannot delete. Evidence deletion already
+has one path, one refusal (`409` when sightings exist) and one confirm, and a
+trash icon in a testing panel is the wrong place to acquire a second.
+
+**The general flow is untouched and is still the way in for everything else.**
+Anything beyond three phones, any webcam, any RTSP camera, any recorded file,
+any still image: Add source, unchanged.
+
+## Exit criteria - verified
+
+PHASE2.md's exit for P8: *"entering three different `http://<ip>:8080/video`
+URLs and saving starts three independent workers, all visible on Live and on
+the camera wall simultaneously."*
+
+`scratch/p8_verify.py` -- **86 passed, 0 failed, 0 skipped in 52s**, log in
+`scratch/p8_verify.log`. `paths.db` points at a throwaway directory, so the
+application database is untouched, and nothing in it reaches the network beyond
+`127.0.0.1`.
+
+**No phone can be reached from a verification run, so three fake ones are
+served.** `scratch/p8_phone_stub.py` puts real footage --
+`footage/clips/20 sec.mp4`, decoded once -- on three ports as
+`multipart/x-mixed-replace` MJPEG: no frame count, no reliable fps, no end,
+which is what a worker sees from an IP Webcam and is why OpenCV treats it as a
+live source rather than a file. Real vehicles rather than a test pattern, so a
+worker reading one produces real sightings and the run proves the path rather
+than that a socket was open.
+
+| check | result |
+|---|---|
+| the address a phone shows completes to the stream URL | ✅ 9 cases, run against the shipped `phoneUrl` text |
+| another camera app's own path is not rewritten | ✅ `/mjpegfeed` and `rtsp://` pass through |
+| a webcam index stays an index, to be refused | ✅ |
+| the same connection test opens a phone address | ✅ with a preview frame, reported live, fps measured |
+| the slot saves through `POST /api/sources` | ✅ 201, bound to `phone_1`, `kind` `network` |
+| holding the address exactly as it was tested | ✅ and placed where the picker put it |
+| with the configured default `frame_skip` | ✅ 3, from `config`, not a constant of its own |
+| and starting on being added, like any other source | ✅ |
+| the `sources` table is the frozen P0 columns | ✅ 13 columns, unchanged |
+| and no table was added to hold slot assignments | ✅ |
+| saving over an occupied slot | ✅ refused, naming what is already there |
+| changing a bound slot's address | ✅ edits the same row, reports `restart_needed` |
+| an address nothing answers on | ✅ fails the test, says what to check |
+| **three addresses, three workers, at once** | ✅ three running at the same moment |
+| **three distinct processes, not one shared** | ✅ three pids, all alive |
+| **the camera wall serves all three** | ✅ multipart MJPEG, real decoded frames, each |
+| **all three write sightings** | ✅ 4 / 1 / 3, with crops on disk |
+| **Live is told, with no reload** | ✅ websocket sighting events from all three |
+| the Sources screen is told the same way | ✅ a `source` event per slot |
+| all three on the map where they were placed | ✅ |
+| a phone carries no `start_time` and no progress | ✅ it is live; there is no end to be a fraction of |
+| and measures its own fps | ✅ |
+| every phone sighting is stamped from the wall clock | ✅ not from the clip the stub is serving |
+| stopping one slot leaves the other two running | ✅ three independent workers |
+| no slot ended in error | ✅ and the server shut all three down cleanly |
+| the frontend | ✅ four changed files parse; the bundle carries the panel |
+| and both paths share one connection test | ✅ its sentence appears in the bundle exactly once |
+
+**What could not be verified here.** Three real phones on real Wi-Fi. The stub
+is a faithful stand-in for the stream -- same transport, same absence of a
+frame count, same `network` kind, same code from `probe.test_source` down --
+but it is on loopback, so what it cannot exercise is the wireless network
+itself: a phone that drops off Wi-Fi mid-run, a router that isolates clients, a
+phone that sleeps its screen and stops streaming. Those are the reconnect and
+supervision paths P1 built and P4b measured, unchanged by this phase.
+
+## Regression -- every documented failure, and two that came back
+
+Every suite re-run against the P8 tree, sequentially (two at once would fight
+over the GPU, the webcam and the ports). Driver `scratch/p8_reg_driver.py`,
+one log each in `scratch/p8_reg_<name>.log`.
+
+    p1_verify              21/22   the documented environmental webcam failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision  14/14   ran again; see below
+    p2_verify              33/34   the documented ocr_tworow500 calibration failure
+    p3_verify              57/57
+    p4a_verify             25/25
+    p4b_verify             74/74   the five P7 recorded are gone; see below
+    p4c_verify             75/75
+    p4d_verify             79/81   the documented application-database failures
+    p4e_verify            128/129  the same
+    p5_verify            109/109
+    p5_notify_verify     181/183   the documented settings.yaml no-op failures
+    p5_number_live         14/15   the same cause
+    p6_verify            114/114
+    p7_verify              97/97
+    p8_verify              86/86   new
+
+**`p5_verify` is unchanged at 109 of 109 and `p6_verify` at 114 of 114**, which
+together say this phase moved nothing about how an alert is decided or how an
+Analyze run is kept. `p4b_verify` is the one that matters most here, because it
+is the Sources suite this phase edits the screen of, and it is **74 of 74**.
+
+**Two failures P7 recorded are not failures any more, and neither was ever
+code.** P7's machine had two `python -m app.run` processes and a probe loop
+spinning from an earlier session, ~6.6 CPU-hours each, that `taskkill` could
+not see; it recorded that the machine wanted a reboot and one re-run. It has
+been rebooted since:
+
+- **`p1_verify_supervision` ran, 14 of 14.** P7 could not measure it at all --
+  it hung at startup with no output, as did two instances started before P7's
+  code existed.
+- **`p4b_verify` is 74 of 74, against the 67 of 72 P7 recorded.** Those five
+  were the recorded-video worker not reaching the end of `23sec.mp4` inside the
+  suite's window on a machine with that much else spinning. It finished in 63s
+  here, against 451s there.
+
+The remaining seven failures all reproduce the counts PROGRESS.md already
+records, check for check: p1's webcam check needs something the COCO model
+calls a vehicle in front of the lens; p2 inspects the highest-confidence plated
+row on `20 sec.mp4`, which `ocr_tworow500` scores as the truck with no legible
+plate; p4d's two and p4e's one are the application database; and p5_notify's
+two and p5_number_live's one are both "exactly one line of settings.yaml
+changed" against a shipped file that already carries the number being saved, so
+zero lines do.
+
+## Files
+
+    web/src/components/PhoneSlots.jsx      NEW -- the panel, the three slots,
+                                           and the address completion rule
+    web/src/components/ConnectionTest.jsx  NEW -- the test panel and its preview
+                                           frame, lifted out of AddSource so both
+                                           paths render the same one
+    web/src/components/AddSource.jsx       renders ConnectionTest instead of its
+                                           own copy; nothing else changed
+    web/src/screens/SourcesScreen.jsx      the panel above the list, and an empty
+                                           state that mentions the slots
+    scratch/p8_phone_stub.py               NEW -- a fake IP Webcam: real footage
+                                           served as MJPEG on 127.0.0.1
+    scratch/p8_verify.py                   NEW -- 86 checks
+    scratch/p8_reg_driver.py               NEW -- the sweep above
+
+`web/dist` rebuilt. No file in `app/` was opened.
+
+## Runnable
+
+    env\Scriptsctivate.bat
+    python -m app.run
+
+Then http://127.0.0.1:8000/sources. Verified on the shipped build: the app
+serves, `/sources` deep-links through the SPA fallback, and the bundle it
+returns carries the panel.
+
+## What is not done, and is not pretended to be
+
+- **No real phone was reached.** The three stubs are the stream a phone serves,
+  on loopback. What they cannot exercise is the wireless network itself -- a
+  phone that leaves Wi-Fi mid-run, a router that isolates its clients, a screen
+  that sleeps and stops the stream. Those are P1's reconnect and supervision
+  paths, unchanged by this phase and measured by `p1_verify_supervision`, but
+  not measured against an actual phone here.
+- **No browser rendered the panel.** There is no headless browser in
+  `web/node_modules` and adding one is forbidden, so it is verified through the
+  built bundle, the HTTP routes and a real running app, as every phase before
+  it was.
+- **A slot cannot delete its source.** Add, re-address, start and stop only;
+  deleting stays on the card below, with the confirm dialog and the refusal
+  that protects sightings.
+- **Three slots, not a configurable number.** PHASE2.md says exactly three and
+  they are three constants. A fourth phone goes through Add source.
+- **The name is the slot's.** A phone saves as `Phone 1`; renaming it to
+  something a control room would recognise is the Edit dialog, and the slot
+  stays bound through the rename because the binding is the source id.
+
+---
+
+# P9 - Live: plate detail on click, browser geolocation, live Follow
+
+Fourth phase of PHASE2.md, and the first of them that needed the websocket to
+carry anything upwards. Three pieces, one phase, and they are unequal: two are
+wiring and the third is a new live capability with state on the server.
+
+Nothing about detection, tracking, OCR, stitching or alerts was opened.
+`app/detect.py`, `app/ocr.py`, `app/grammar.py`, `app/stitch.py`,
+`app/alerts.py`, `app/analyze.py`, `app/trajectory.py` and every model weight
+are byte-identical, no table gained a field, and `matching.py`'s scoring is
+untouched -- the one line added to it exposes a constant that already existed
+under a private name, for the same reason `plate_forms` is already exposed.
+
+## The three pieces, and what each one actually was
+
+**1. Clicking a live sighting opens the same evidence panel, everywhere.** The
+feed already did. Two places did not, and they were not the same problem:
+
+- **A map marker** is a camera, not a sighting, so there was nothing to open.
+  It now opens the newest sighting from that camera -- read from the server
+  rather than from the feed, which holds the last eighty rows across every
+  source and may not hold that camera's newest at all. A camera that has not
+  seen anything says so and says what will fill it.
+- **A camera-wall box** could not be clicked at all, and the reason is the
+  design of the wall rather than an oversight. The wall is an `<img>` pointed
+  at `multipart/x-mixed-replace`, the boxes are burned into the JPEG by the
+  worker that decoded the frame, and CLAUDE.md's rule that the MJPEG endpoint
+  must never re-decode the source is what keeps it that way. A browser cannot
+  hit-test pixels.
+
+  So the boxes are published a second time, as numbers.
+  `_overlay_boxes` builds them from the same `detections` and `tracks` that
+  `_draw_overlay` was just handed, in **fractions of the frame** -- the preview
+  is downscaled to 720px and then fitted to whatever the browser gave the tile,
+  and a fraction survives both of those where a pixel survives neither. They
+  ride on the existing preview message and `GET /api/sources/{id}/boxes`
+  returns the newest one without its JPEG.
+
+  **This is in memory and it is not data.** No table, no column, no file: the
+  preview dict is the transport it already travels on, and `drop_viewer`
+  discards the whole preview when the last tile closes -- so a source nobody is
+  watching answers with an empty list, which is true rather than an error.
+
+**2. Browser geolocation.** `navigator.geolocation.getCurrentPosition` once
+when Live opens, and a marker if it answers. It is styled as deliberately unlike
+a source marker as the palette allows -- a hollow ink-coloured ring, not a
+filled plate-colour dot -- because colour on that map means *the status of a
+camera* and this is not a camera. Denied, timed out, or served over plain http
+from another machine all end the same way: no marker, no error state, and a map
+that is exactly what it was.
+
+It never reaches a timestamp, a sighting or a placement. CLAUDE.md's timestamp
+rule is settled inside the worker and this is a browser saying where its user is
+standing.
+
+**3. Follow.** A live watch on one vehicle, started from the same panel that
+offers Trace, and the two are deliberately two buttons rather than one control
+with a mode: **Trace is a search over what has been written, Follow is a watch
+on what has not happened yet.**
+
+## Where the follow set lives, and why it can live nowhere else
+
+`app/follow.py` holds the rules; the set itself lives on the websocket handler,
+one `FollowSet` per connection, created when the socket is accepted and cleared
+in the `finally` that unregisters it. That is not a convenience:
+
+- **Two browsers follow different vehicles**, so a process-wide set would have
+  to be keyed by connection anyway.
+- **A follow is a session, not a record**, so there is no row to clean up when
+  a laptop lid closes -- and nothing to leave behind if the app is killed.
+- **The writer never touches it.** The writer commits and publishes to the hub
+  exactly as it did in P4a; the question "is anybody watching for this
+  vehicle?" is asked on the event loop, on the way out to one socket. The one
+  writer stays one writer and gains no work.
+
+The socket had only ever sent. It now also receives, and the receive is a
+separate task whose answers are pushed onto **the connection's own event
+queue** rather than sent from there -- two tasks sending on one websocket
+interleave frames and corrupt the stream, so the send loop remains the only
+thing that writes to the socket.
+
+## The decisions, and what each one refuses
+
+**Matching is `matching.py`'s, and never string equality.** Both sides of a
+follow comparison are OCR output, so both offer their voted read, their raw
+read and their stored candidates -- `matching.plate_forms`, the same public
+entry P5's blacklist uses -- and a match found through a candidate on either
+side carries the same 0.03 penalty the Trace search spends. Measured in the
+suite: `MH15HY2237` followed, `MH15HY2277` arriving at another camera scores
+0.900 and is an update; `KA05MG9022` scores 0.165 and is not.
+
+**The target is read from the database, never from the browser.** A client
+sends a `sighting_id`; the server reads that row and builds the follow forms
+from it. A client that sent its own plate strings could follow a vehicle that
+was never committed.
+
+**A follow that ends says why.** `stopped`, `timeout`, or `disconnected` --
+the screen renders "No longer visible." for the second. Nothing expires
+quietly, because a live watch that silently stopped watching is worse than one
+that was never started.
+
+**The wait is shortened to the next deadline.** The socket's keepalive is 20
+seconds and the timeout can fall between two of them, so the handler waits for
+`min(keepalive, next expiry)`. Measured: a three-second follow ends at 3.0s,
+not on the next ping.
+
+**A sighting with no plate cannot be followed, and is refused with the
+reason.** A plate-less sighting is a valid row -- the frozen contract says so
+-- and it offers nothing to match on. The alternative is a session that can
+never fire.
+
+**`follow_timeout_seconds` is config, and is an assumption stated as one.** 120
+seconds, PHASE2.md's default. Nothing in this repo measures how long a vehicle
+takes to reach a second camera, because no two cameras have been placed on one
+road yet; the number is in `config/settings.yaml` with that said next to it.
+
+**A wall box that has no row yet says so.** A sighting is written when its
+track ends, so a vehicle still in frame has no row -- clicking its box says
+"still in frame at <camera>. Its evidence is written when it leaves" rather
+than failing or inventing a panel.
+
+**`track_id` on `/api/sightings` is refused without a `source_id`.** Track ids
+are unique within one worker run, which is what the frozen contract says, so a
+bare track id would answer with somebody else's vehicle.
+
+## Exit criteria - verified
+
+PHASE2.md's exit for P9: *"starting Follow on a sighting from one camera, then
+the same vehicle appearing on a second connected camera, updates the map path
+live with no page reload or manual re-search."*
+
+`scratch/p9_verify.py` -- **79 passed, 0 failed, 0 skipped in 39s**, log in
+`scratch/p9_verify.log`. `paths.db` points at a throwaway directory, so the
+application database is untouched, and nothing in it reaches the network at
+all.
+
+The exit criterion is pressed with **two real workers on two real sources**.
+The same clip is served as two placed cameras, so the same vehicles pass both,
+which is the closest this machine comes to one vehicle driving past two
+cameras. Camera A ran to the end and read `MH15BY2231`; Follow was started on
+that row over the open socket; camera B was started while the follow was open,
+and the row it wrote for the same vehicle arrived as a `follow_update` on that
+same socket, scored 1.0.
+
+| check | result |
+|---|---|
+| a follow target offers every string its sighting does | PASS |
+| a second camera's different read still matches | PASS `MH15HY2277` 0.900 |
+| and it is not string equality doing it | PASS |
+| an unrelated plate does not match | PASS 0.165 |
+| a match found only in the stored candidates is found | PASS, marked `candidate` |
+| and scored below the same match on the voted plate | PASS, penalty 0.03 |
+| the session survives while it is being seen | PASS |
+| the deadline is measured from the last match, not the start | PASS |
+| a plate-less sighting is refused with the reason | PASS |
+| **a follow starts over the same socket the feed arrives on** | PASS |
+| a differently-read sighting of the same vehicle is an update | PASS |
+| a different vehicle is not | PASS |
+| stopping says so rather than going quiet | PASS |
+| and a stopped follow stops matching | PASS |
+| a sighting that does not exist is refused | PASS |
+| **one connection's follows are invisible to another** | PASS, both still get the sighting |
+| **a follow does not survive the connection that held it** | PASS |
+| **and nothing about it was written down** | PASS, four tables, 14 columns |
+| a follow that stops being seen ends, with `timeout` | PASS at 3.0s |
+| and ends when it is true, not on the next keepalive | PASS, keepalive is 20s |
+| **two cameras, one vehicle, one open socket** | PASS |
+| **the second camera's row arrives as a follow update** | PASS, scored 1.0 |
+| **on the socket that was already open -- no reload, no re-search** | PASS |
+| a source nobody is watching answers with no boxes, not an error | PASS |
+| a watched source publishes the boxes it just drew | PASS |
+| each is a fraction of the frame, so it survives the downscale | PASS |
+| carrying the identity that was drawn on it | PASS |
+| no image is in that answer | PASS |
+| nobody watching, nothing kept | PASS |
+| **a box resolves to the row its track was written as** | PASS, 2 of 2 |
+| a track id without its source is refused, with what to do | PASS |
+| the seven changed frontend files parse | PASS |
+| the bundle carries Follow, its stop, and "No longer visible." | PASS |
+| the bundle asks for geolocation and describes it as not a camera | PASS |
+| the wall asks where its boxes are | PASS |
+| the evidence panel is one component, not two that look alike | PASS |
+
+**What could not be verified here.** No browser rendered any of it. There is no
+headless browser in `web/node_modules` and adding one is forbidden, so the map
+marker, the "you are here" dot, the trail polyline and the box overlay are
+verified through the built bundle, the HTTP routes and a real running app, as
+every phase before this one was. Geolocation in particular cannot be exercised
+at all without a browser: what is checked is that it is asked for, that a
+refusal is a no-op, and that the code path renders nothing on denial.
+
+## Regression -- every documented failure, and nothing new
+
+Every suite re-run against the P9 tree, sequentially (two at once would fight
+over the GPU, the webcam and the ports). Driver `scratch/p9_reg_driver.py`, one
+log each in `scratch/p9_reg_<name>.log`, summary in
+`scratch/p9_reg_summary.log`.
+
+    p1_verify              21/22   the documented environmental webcam failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision  14/14
+    p2_verify              33/34   the documented ocr_tworow500 calibration failure
+    p3_verify              57/57
+    p4a_verify             25/25
+    p4b_verify             74/74
+    p4c_verify             75/75
+    p4d_verify             79/81   the documented application-database failures
+    p4e_verify            128/129  the same
+    p5_verify            109/109
+    p5_notify_verify     181/183   the documented settings.yaml no-op failures
+    p5_number_live         14/15   the same cause
+    p6_verify            114/114
+    p7_verify              97/97
+    p8_verify              86/86
+    p9_verify              79/79   new
+
+**Check for check, this is P8's sweep with P9's suite added.** Every count is
+identical to the one PROGRESS.md records for P8, and every failing check is one
+of the seven already documented, failing for the reason already documented:
+p1's webcam check needs something the COCO model calls a vehicle in front of
+the lens; p2 inspects the highest-confidence plated row on `20 sec.mp4`, which
+`ocr_tworow500` scores as the truck with no legible plate; p4d's two and p4e's
+one are the application database; and p5_notify's two and p5_number_live's one
+are both "exactly one line of settings.yaml changed" against a shipped file
+that already carries the number being saved, so zero lines do.
+
+**`p4a_verify` is the one that matters most here** -- it is the websocket suite,
+and this phase gave that socket a direction it did not have. It is **25 of 25**.
+`p4b_verify` at 74 of 74 says the same about the camera wall, whose tile now
+carries click targets.
+
+The suites were also run with the app itself rather than a test client: the
+shipped build serves, `/sources` deep-links through the SPA fallback,
+`/api/sources/nope/boxes` answers `{"boxes": []}` rather than an error, a bare
+`track_id` is refused with its sentence, and a real websocket client following
+a sighting that does not exist gets
+`{"type": "follow_error", "detail": "There is no sighting 999999 to follow."}`.
+
+## Files
+
+    app/follow.py                          NEW -- the follow rules: target forms,
+                                           the fuzzy score, the per-connection set
+                                           and its clock
+    app/api.py                             the websocket receives as well as sends;
+                                           GET /api/sources/{id}/boxes;
+                                           track_id on /api/sightings
+    app/worker.py                          _overlay_boxes: the drawn boxes as
+                                           fractions, on the preview message
+    app/matching.py                        one line -- CANDIDATE_PENALTY exposed
+                                           under a public name
+    config/settings.yaml                   follow_timeout_seconds, follow_min_score
+    web/src/components/FollowStrip.jsx     NEW -- what is being followed, and why
+                                           a session ended
+    web/src/screens/LiveScreen.jsx         geolocation, the follow sessions and
+                                           their trails, marker click opens evidence
+    web/src/components/MapCanvas.jsx       the "you are here" marker and the trails
+    web/src/components/CameraMarker.jsx    hereIcon
+    web/src/components/EvidencePanel.jsx   the Follow button beside Trace
+    web/src/components/FeedTile.jsx        the click targets over the wall's boxes
+    web/src/screens/SourcesScreen.jsx      a wall box opens the evidence panel
+    web/src/lib/socket.js                  the socket can send
+    web/src/lib/api.js                     getStreamBoxes, getSightingByTrack,
+                                           getSightings by source
+    scratch/p9_verify.py                   NEW -- 79 checks
+    scratch/p9_reg_driver.py               NEW -- the sweep below
+
+`web/dist` rebuilt.
+
+## Runnable
+
+    env\Scripts\activate.bat
+    python -m app.run
+
+Then http://127.0.0.1:8000/.
+
+## What is not done, and is not pretended to be
+
+- **The trail is drawn through cameras, not through roads.** It is a polyline
+  between the sources a followed vehicle was seen at, in the order it was seen.
+  It is not a route and does not claim to be one -- the same honesty P4d's
+  trajectory keeps.
+- **An unplaced camera contributes no point to a trail.** `lat` and `lon` are
+  nullable and a guessed position would draw a journey through a road that does
+  not exist.
+- **The follow timeout is an assumption, not a measurement.** 120 seconds,
+  written in config with that said beside it. It needs two real cameras on one
+  road to become a number.
+- **Follow lives on the Live screen only.** The evidence panel opened from the
+  camera wall and from Trace has no Follow button, because neither of those
+  screens holds the socket a follow lives on. That is a deliberate limit and
+  not a hidden one: the panel takes the handler or does not render the button.
+- **A reconnect does not resume a follow.** The server clears the set with the
+  connection, so the screen marks the session ended and says the feed dropped.
+  Replaying the start onto a new connection would resurrect a watch the user
+  had already been told was over.
+- **The wall's click targets are polled twice a second**, not per frame. A box
+  under a fast vehicle can be a frame or two behind what is drawn.

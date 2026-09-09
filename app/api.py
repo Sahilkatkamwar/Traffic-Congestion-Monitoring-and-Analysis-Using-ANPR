@@ -46,6 +46,7 @@ from app import (
     analyze as analysis,
     config,
     db,
+    follow as follow_rules,
     matching,
     notify,
     probe,
@@ -190,12 +191,34 @@ def create_app(pipeline=None):
     def sightings(
         limit: int = Query(100, ge=1, le=1000),
         source_id: str | None = None,
+        track_id: int | None = None,
     ):
+        """Committed rows, newest first.
+
+        `track_id` is P9's: a box on the camera wall carries the track id the
+        worker drew on it, and clicking it has to reach the row that track was
+        written as. It is only meaningful beside a source -- track ids are
+        unique within one worker run, which is what the frozen contract says --
+        so it is refused on its own rather than answering with rows from every
+        camera that happens to share the number.
+        """
+        if track_id is not None and not source_id:
+            return fail(
+                400,
+                "A track id belongs to one source. Ask for a track_id together "
+                "with the source_id it was seen on.",
+            )
         sql = "SELECT * FROM sightings"
         params = []
+        where = []
         if source_id:
-            sql += " WHERE source_id = ?"
+            where.append("source_id = ?")
             params.append(source_id)
+        if track_id is not None:
+            where.append("track_id = ?")
+            params.append(track_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         # Newest first: the live feed wants the most recent sighting at the top.
         sql += " ORDER BY first_seen_ts DESC, sighting_id DESC LIMIT ?"
         params.append(limit)
@@ -387,6 +410,47 @@ def create_app(pipeline=None):
                 f"file is not open in another program and not read-only.",
             )
         return _notifier().describe()
+
+    @app.post("/api/notifications/test")
+    def send_test_notification():
+        """Send one message now, because somebody asked for one. (P7)
+
+        The only thing on this screen that reaches the gateway without a
+        vehicle. It exists because the question "does the control room's phone
+        actually receive these" has no answer until a message arrives, and
+        waiting for a blacklisted plate to drive past to find out is not one.
+
+        It sends through the same notifier, the same queue and the same daemon
+        thread an alert goes through -- a second path would prove nothing about
+        the first -- and it is tagged `manual_test` in the job, the log and the
+        response so it is never mistaken for an alert. Nothing is recorded: no
+        alerts row, no sighting, no blacklist entry, and the screen's "last
+        notification" still means the last alert.
+
+        The answer is the record to poll, not the outcome: the network has not
+        happened yet when this returns, exactly as it has not when a sighting
+        commits.
+        """
+        notifier = _notifier()
+        record = notifier.send_test()
+        if record["status"] == "refused":
+            # readiness() already wrote the sentence for the person reading it,
+            # and it names no file, key or environment variable.
+            return fail(400, record["detail"])
+        return {**notifier.describe(), "test": record}
+
+    @app.get("/api/notifications/test/{test_id}")
+    def test_notification(test_id: int):
+        """How one manual test ended, or that it is still going."""
+        notifier = _notifier()
+        record = notifier.test_record(test_id)
+        if record is None:
+            return fail(
+                404,
+                f"There is no test message {test_id}. Tests are kept only while "
+                f"the app is running -- send another one.",
+            )
+        return {**notifier.describe(), "test": record}
 
     @app.delete("/api/notifications/number")
     def clear_control_room_number():
@@ -834,6 +898,92 @@ def create_app(pipeline=None):
             headers={"Cache-Control": "no-store, no-cache", "Pragma": "no-cache"},
         )
 
+    @app.get("/api/sources/{source_id}/boxes")
+    def stream_boxes(source_id: str):
+        """Where the boxes on the camera wall's newest frame are. P9.
+
+        The wall is an <img> pointed at multipart JPEG, so the boxes are in the
+        pixels and a browser cannot tell where one is. This is the same
+        detections the worker just drew, in fractions of the frame, so a tile
+        can lay a click target over each one and open the evidence for it.
+
+        In memory only. It is the preview message the worker published, minus
+        the JPEG, and it exists only while somebody is watching that source --
+        `drop_viewer` discards the preview when the last tile closes. Nothing
+        here is written and no table gained a column to carry it.
+        """
+        if pipeline is None:
+            return fail(503, "No pipeline is running, so there are no live frames.")
+        shot = pipeline.latest_preview(source_id)
+        if shot is None:
+            # Not an error: the tile asks before its first frame arrives, and
+            # a source nobody is watching keeps no preview at all.
+            return {"source_id": source_id, "seq": 0, "ts": None, "boxes": []}
+        return {
+            "source_id": source_id,
+            "seq": shot.get("seq", 0),
+            "ts": shot.get("ts"),
+            "fps": shot.get("fps"),
+            "boxes": shot.get("boxes") or [],
+        }
+
+    async def _follow_control(websocket, queue, follows):
+        """Read follow commands from one browser. P9.
+
+        Answers are pushed onto the connection's own event queue rather than
+        sent from here: the send loop below is the only thing that writes to
+        this socket, because two tasks sending on one websocket interleave
+        frames and corrupt the stream.
+        """
+        while True:
+            message = await websocket.receive_json()
+            if not isinstance(message, dict):
+                continue
+            kind = message.get("type")
+
+            if kind == "follow_start":
+                sighting_id = message.get("sighting_id")
+                conn = db.connect()
+                try:
+                    row = conn.execute(
+                        "SELECT * FROM sightings WHERE sighting_id = ?", (sighting_id,)
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if row is None:
+                    queue.put_nowait({
+                        "type": "follow_error",
+                        "sighting_id": sighting_id,
+                        "detail": f"There is no sighting {sighting_id} to follow.",
+                    })
+                    continue
+                try:
+                    # The target is read from the row, never from the browser:
+                    # a follow is matched against what was committed, not
+                    # against what a client says was committed.
+                    session = follows.start(dict(row))
+                except ValueError as exc:
+                    queue.put_nowait({
+                        "type": "follow_error",
+                        "sighting_id": sighting_id,
+                        "detail": str(exc),
+                    })
+                    continue
+                queue.put_nowait({
+                    "type": "follow_started",
+                    "follow": follow_rules.public(session),
+                })
+
+            elif kind == "follow_stop":
+                session = follows.stop(message.get("follow_id"))
+                if session is not None:
+                    queue.put_nowait({
+                        "type": "follow_ended",
+                        "follow_id": session["follow_id"],
+                        "plate_text": session["plate_text"],
+                        "reason": "stopped",
+                    })
+
     @app.websocket("/api/ws")
     async def live(websocket: WebSocket):
         """Committed rows, pushed as they land.
@@ -841,21 +991,72 @@ def create_app(pipeline=None):
         The client still loads /api/sightings first. This carries what happens
         after that, and a reconnect reloads rather than replaying: the database
         is the record, this is the notification.
+
+        P9 gave it a direction back. A connection may ask to follow a vehicle,
+        and the set of what it is following lives here, on the connection, for
+        as long as the connection does -- see app/follow.py for why that is the
+        only place it can live.
         """
         await websocket.accept()
         queue = hub.register()
+        settings = config.load_settings().get("defaults", {})
+        follows = follow_rules.FollowSet(
+            timeout_sec=settings.get(
+                "follow_timeout_seconds", follow_rules.DEFAULT_TIMEOUT_SEC
+            ),
+            min_score=settings.get("follow_min_score", follow_rules.DEFAULT_MIN_SCORE),
+        )
+        control = asyncio.create_task(_follow_control(websocket, queue, follows))
         try:
             while True:
+                # A follow that is about to time out shortens the wait, so
+                # "no longer visible" appears when it is true rather than on
+                # the next keepalive.
+                deadline = follows.next_deadline()
+                wait = PING_EVERY_SEC if deadline is None else min(PING_EVERY_SEC, deadline)
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=PING_EVERY_SEC)
+                    event = await asyncio.wait_for(queue.get(), timeout=max(0.05, wait))
                 except asyncio.TimeoutError:
                     # Also how a socket whose browser is gone gets noticed: the
                     # send raises and we fall out of the loop.
                     event = {"type": "ping"}
+
+                if control.done() and not control.cancelled():
+                    # receive_json raised: the browser is gone, or it sent
+                    # something that is not JSON. Either way this socket is over.
+                    raise WebSocketDisconnect(1000)
+
                 await websocket.send_json(event)
+
+                # The same committed row, asked whether anybody is watching for
+                # it. Matching is matching.py's, so a second camera reading the
+                # plate differently is still this vehicle.
+                if event.get("type") == "sighting":
+                    for session, value, text, how in follows.match(event["sighting"]):
+                        await websocket.send_json({
+                            "type": "follow_update",
+                            "follow_id": session["follow_id"],
+                            "follow": follow_rules.public(session),
+                            "sighting": event["sighting"],
+                            "score": value,
+                            "matched_text": text,
+                            "matched_via": how,
+                        })
+
+                for session in follows.expired():
+                    await websocket.send_json({
+                        "type": "follow_ended",
+                        "follow_id": session["follow_id"],
+                        "plate_text": session["plate_text"],
+                        "reason": "timeout",
+                    })
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             pass
         finally:
+            control.cancel()
+            # The set dies with the connection. Nothing was persisted, so there
+            # is nothing to clean up anywhere else.
+            follows.clear()
             hub.unregister(queue)
 
     # ---------------------------------------------------------------- analyze

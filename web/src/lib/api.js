@@ -45,7 +45,14 @@ const patch = json('PATCH')
 
 export const getHealth = () => get('/api/health')
 export const getSources = () => get('/api/sources')
-export const getSightings = (limit = 80) => get(`/api/sightings?limit=${limit}`)
+// One source's rows as well as everybody's: P9's map marker opens the newest
+// sighting from the camera that was clicked, which may be older than the
+// eighty the live feed holds.
+export const getSightings = (limit = 80, { sourceId = null } = {}) =>
+  get(
+    `/api/sightings?limit=${limit}` +
+      (sourceId ? `&source_id=${encodeURIComponent(sourceId)}` : ''),
+  )
 // --- alerts (P5) -----------------------------------------------------------
 //
 // Every alert arrives with the sightings it is about already attached: an
@@ -84,6 +91,15 @@ export const setControlRoomNumber = (number) =>
   post('/api/notifications/number', { number })
 export const clearControlRoomNumber = () =>
   send('/api/notifications/number', { method: 'DELETE' })
+
+// One message, sent because somebody pressed the button rather than because a
+// vehicle was seen. The POST answers with the record to watch, not with the
+// outcome -- the send is on the server's own thread, the same one an alert
+// goes out on -- so the screen polls that record until it stops saying
+// `sending` and then shows what happened.
+export const sendTestNotification = () => post('/api/notifications/test')
+export const getTestNotification = (testId) =>
+  get(`/api/notifications/test/${encodeURIComponent(testId)}`)
 
 // --- sources (P4b) ---------------------------------------------------------
 
@@ -197,3 +213,24 @@ export const cropUrl = (path) => (path ? `/${path}` : null)
 // needs a url the browser has not seen.
 export const streamUrl = (id, nonce) =>
   `/api/sources/${encodeURIComponent(id)}/stream.mjpg?v=${nonce}`
+
+// --- live detail on click (P9) ---------------------------------------------
+//
+// The wall's boxes are burned into the JPEG the worker drew them on, so a
+// browser cannot tell where one is. This is the same detections as numbers,
+// in fractions of the frame, held in memory beside the frame they belong to
+// and gone the moment nobody is watching that source.
+export const getStreamBoxes = (id) =>
+  get(`/api/sources/${encodeURIComponent(id)}/boxes`)
+
+// The row a wall box belongs to. Track ids are unique within one worker run,
+// so the source is part of the question -- asking for a track id on its own is
+// refused rather than answered with somebody else's vehicle. A track still in
+// frame has no row yet, which is why this can honestly return nothing.
+export async function getSightingByTrack(sourceId, trackId) {
+  const rows = await get(
+    `/api/sightings?limit=1&source_id=${encodeURIComponent(sourceId)}` +
+      `&track_id=${encodeURIComponent(trackId)}`,
+  )
+  return rows[0] || null
+}

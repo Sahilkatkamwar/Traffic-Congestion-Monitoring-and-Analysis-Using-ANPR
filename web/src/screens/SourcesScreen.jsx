@@ -3,17 +3,21 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import SourceCard from '../components/SourceCard'
 import FeedTile from '../components/FeedTile'
 import AddSource from '../components/AddSource'
+import PhoneSlots from '../components/PhoneSlots'
 import MapPicker from '../components/MapPicker'
 import Modal from '../components/Modal'
 import Empty from '../components/Empty'
+import EvidencePanel from '../components/EvidencePanel'
 import { Button, Field, Input, Select } from '../components/Field'
 import {
   deleteSource,
+  getSightingByTrack,
   getSources,
   startSource,
   stopSource,
   updateSource,
 } from '../lib/api'
+import { useRoute } from '../lib/router'
 import { openLiveFeed } from '../lib/socket'
 
 // Sources are runtime state. Everything on this screen writes to the database
@@ -31,7 +35,12 @@ const TABS = [
 
 export default function SourcesScreen() {
   const reduced = useReducedMotion()
+  const { navigate } = useRoute()
   const [tab, setTab] = useState('list')
+  // P9. The sighting a wall box was clicked on, shown in the same evidence
+  // panel the Live feed opens. The panel is the same component, not a second
+  // one that looks like it.
+  const [evidence, setEvidence] = useState(null)
   const [sources, setSources] = useState([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(null)
@@ -102,6 +111,27 @@ export default function SourcesScreen() {
       }
     },
     [load, say],
+  )
+
+  // P9. A box on the wall is a vehicle that is still in frame, and a sighting
+  // is written when its track ends -- so the row may not exist yet. That is not
+  // an error and it is not hidden: the tile says what is true, which is that
+  // the evidence is written when the vehicle leaves.
+  const openBox = useCallback(
+    async (source, box) => {
+      try {
+        const row = await getSightingByTrack(source.source_id, box.track_id)
+        if (row) setEvidence(row)
+        else
+          say(
+            `${box.vehicle_type} #${box.track_id} is still in frame at ${source.name}. ` +
+              `Its evidence is written when it leaves.`,
+          )
+      } catch (error) {
+        say(error.message, 'error')
+      }
+    },
+    [say],
   )
 
   const running = useMemo(() => sources.filter((s) => s.status === 'running'), [sources])
@@ -188,6 +218,15 @@ export default function SourcesScreen() {
         </AnimatePresence>
 
         <div className="mt-4 pb-10">
+          {tab === 'list' && !loadError && !loading && (
+            <div className="mb-3">
+              <PhoneSlots
+                sources={sources}
+                onChanged={load}
+                onNotice={(message) => say(message)}
+              />
+            </div>
+          )}
           {loadError ? (
             <Empty
               title="The source list could not load."
@@ -198,7 +237,7 @@ export default function SourcesScreen() {
           ) : sources.length === 0 ? (
             <Empty
               title="No sources yet."
-              action="Add a live camera, a recorded video, or a still image. A source starts processing the moment it is added."
+              action="Paste a phone address into a slot above, or add a live camera, a recorded video, or a still image. A source starts processing the moment it is added."
             />
           ) : tab === 'list' ? (
             <motion.div layout={!reduced} className="flex flex-col gap-3">
@@ -230,6 +269,7 @@ export default function SourcesScreen() {
                   key={source.source_id}
                   source={source}
                   onOpenSource={() => setTab('list')}
+                  onOpenBox={openBox}
                 />
               ))}
             </div>
@@ -257,6 +297,18 @@ export default function SourcesScreen() {
           setEditing(null)
         }}
         onError={(message) => say(message, 'error')}
+      />
+
+      <EvidencePanel
+        sighting={evidence}
+        sourceName={
+          evidence
+            ? sources.find((s) => s.source_id === evidence.source_id)?.name ||
+              evidence.source_id
+            : ''
+        }
+        onClose={() => setEvidence(null)}
+        onTrace={(plate) => navigate(`/trace/${encodeURIComponent(plate)}`)}
       />
 
       <Modal

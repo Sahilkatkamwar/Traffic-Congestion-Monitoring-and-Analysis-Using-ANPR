@@ -3,6 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import MapCanvas from '../components/MapCanvas'
 import SightingCard from '../components/SightingCard'
 import EvidencePanel from '../components/EvidencePanel'
+import FollowStrip from '../components/FollowStrip'
 import Empty from '../components/Empty'
 import { getAlerts, getSightings, getSources } from '../lib/api'
 import { openLiveFeed } from '../lib/socket'
@@ -36,11 +37,27 @@ export default function LiveScreen() {
   const [connection, setConnection] = useState('connecting')
   const [loadError, setLoadError] = useState(null)
   const [loading, setLoading] = useState(true)
+  // The row itself, not its id: a marker click opens a sighting that may be
+  // older than the eighty this feed holds, and an id would have nothing to
+  // look up.
   const [selected, setSelected] = useState(null)
   const [activeSourceIds, setActiveSourceIds] = useState(() => new Set())
   const [newIds, setNewIds] = useState(() => new Set())
+  const [notice, setNotice] = useState(null)
+  // P9. What this browser is following, keyed by the server's follow id. The
+  // server holds the same set on the connection; this is the drawing of it.
+  const [follows, setFollows] = useState([])
+  const [here, setHere] = useState(null)
 
   const pulseTimers = useRef(new Map())
+  const feedRef = useRef(null)
+  const noticeTimer = useRef(null)
+
+  const say = useCallback((message) => {
+    setNotice(message)
+    clearTimeout(noticeTimer.current)
+    noticeTimer.current = setTimeout(() => setNotice(null), 6000)
+  }, [])
 
   const load = useCallback(async () => {
     try {
@@ -63,6 +80,36 @@ export default function LiveScreen() {
   useEffect(() => {
     load()
   }, [load])
+
+  // P9. Browser geolocation, asked for once when the screen opens.
+  //
+  // A map convenience and nothing else. It never reaches a timestamp, a
+  // sighting, or a camera's placement -- CLAUDE.md's timestamp rule is settled
+  // inside the worker and this is a browser telling the map where its user is
+  // standing. Refused, unavailable or insecure: nothing is shown, nothing is
+  // blocked, and the screen is exactly what it was.
+  useEffect(() => {
+    if (!('geolocation' in navigator)) return undefined
+    let cancelled = false
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        if (cancelled) return
+        setHere({
+          lat: position.coords.latitude,
+          lon: position.coords.longitude,
+          accuracy: position.coords.accuracy,
+        })
+      },
+      () => {
+        // Denied, timed out, or served over plain http from another machine.
+        // All three mean the same thing here: no marker.
+      },
+      { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 },
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // Mark a source as active, and stop marking it a couple of seconds later.
   const markActive = useCallback((sourceId) => {
@@ -92,6 +139,19 @@ export default function LiveScreen() {
         // A reconnect reloads rather than replaying: anything that happened
         // while the socket was down is in the database, not in the socket.
         if (status === 'live') load()
+        if (status === 'offline') {
+          // P9. The follow set lives on the connection and the server clears
+          // it when the connection ends, so a dropped socket ends every follow
+          // -- and the screen says so rather than showing a watch that is not
+          // being kept.
+          setFollows((current) =>
+            current.map((entry) =>
+              entry.status === 'live'
+                ? { ...entry, status: 'ended', reason: 'disconnected' }
+                : entry,
+            ),
+          )
+        }
       },
       onEvent: (event) => {
         if (event.type === 'sighting') {
@@ -127,24 +187,91 @@ export default function LiveScreen() {
           // A source deleted on the Sources screen has to leave this map too,
           // or its marker outlives the record it was drawn from.
           setSources((current) => current.filter((s) => s.source_id !== event.source_id))
+        } else if (event.type === 'follow_started') {
+          // The session as the server made it. The first stop of the trail is
+          // the sighting it was started from.
+          setFollows((current) => [
+            {
+              ...event.follow,
+              status: 'live',
+              reason: null,
+              stops: [
+                {
+                  sighting_id: event.follow.sighting_id,
+                  source_id: event.follow.source_id,
+                  ts: event.follow.started_ts,
+                  plate_text: event.follow.plate_text,
+                  score: 1,
+                  matched_via: 'plate',
+                },
+              ],
+            },
+            ...current.filter((entry) => entry.follow_id !== event.follow.follow_id),
+          ])
+        } else if (event.type === 'follow_update') {
+          const row = event.sighting
+          markActive(row.source_id)
+          setFollows((current) =>
+            current.map((entry) =>
+              entry.follow_id !== event.follow_id
+                ? entry
+                : {
+                    ...entry,
+                    matches: event.follow.matches,
+                    status: 'live',
+                    stops: entry.stops.some((s) => s.sighting_id === row.sighting_id)
+                      ? entry.stops
+                      : [
+                          ...entry.stops,
+                          {
+                            sighting_id: row.sighting_id,
+                            source_id: row.source_id,
+                            ts: row.first_seen_ts,
+                            plate_text: row.plate_text,
+                            score: event.score,
+                            matched_via: event.matched_via,
+                          },
+                        ],
+                  },
+            ),
+          )
+        } else if (event.type === 'follow_ended') {
+          setFollows((current) =>
+            current.map((entry) =>
+              entry.follow_id === event.follow_id
+                ? { ...entry, status: 'ended', reason: event.reason }
+                : entry,
+            ),
+          )
+        } else if (event.type === 'follow_error') {
+          say(event.detail)
         }
       },
     })
+    feedRef.current = close
     return () => {
       close()
+      feedRef.current = null
       for (const timer of pulseTimers.current.values()) clearTimeout(timer)
       pulseTimers.current.clear()
+      clearTimeout(noticeTimer.current)
     }
-  }, [load, markActive])
+  }, [load, markActive, say])
 
   const sourceNames = useMemo(
     () => new Map(sources.map((s) => [s.source_id, s.name])),
     [sources],
   )
-  const placedCount = useMemo(
-    () => sources.filter((s) => s.lat != null && s.lon != null).length,
+  const sourcePlaces = useMemo(
+    () =>
+      new Map(
+        sources
+          .filter((s) => s.lat != null && s.lon != null)
+          .map((s) => [s.source_id, [s.lat, s.lon]]),
+      ),
     [sources],
   )
+  const placedCount = sourcePlaces.size
   const runningCount = useMemo(
     () => sources.filter((s) => s.status === 'running').length,
     [sources],
@@ -154,15 +281,95 @@ export default function LiveScreen() {
     [sources],
   )
 
+  // P9. Follow, started and stopped over the same socket the feed arrives on.
+  const startFollow = useCallback(
+    (sighting) => {
+      const sent = feedRef.current?.send?.({
+        type: 'follow_start',
+        sighting_id: sighting.sighting_id,
+      })
+      if (!sent) {
+        say('The live feed is reconnecting, so nothing can be followed yet. Try again in a moment.')
+      }
+    },
+    [say],
+  )
+
+  const stopFollow = useCallback(
+    (followId) => {
+      const sent = feedRef.current?.send?.({ type: 'follow_stop', follow_id: followId })
+      if (!sent) {
+        // The connection is gone, which already ended the session server-side.
+        setFollows((current) =>
+          current.map((entry) =>
+            entry.follow_id === followId
+              ? { ...entry, status: 'ended', reason: 'disconnected' }
+              : entry,
+          ),
+        )
+      }
+    },
+    [],
+  )
+
+  const dismissFollow = useCallback((followId) => {
+    setFollows((current) => current.filter((entry) => entry.follow_id !== followId))
+  }, [])
+
+  const followingIdsBySighting = useMemo(
+    () =>
+      new Map(
+        follows
+          .filter((entry) => entry.status === 'live')
+          .map((entry) => [entry.sighting_id, entry.follow_id]),
+      ),
+    [follows],
+  )
+
+  const trails = useMemo(
+    () =>
+      follows
+        .filter((entry) => entry.status === 'live')
+        .map((entry) => ({
+          follow_id: entry.follow_id,
+          points: entry.stops
+            .map((stop) => sourcePlaces.get(stop.source_id))
+            .filter(Boolean),
+        })),
+    [follows, sourcePlaces],
+  )
+
+  // A marker is a camera, and what a camera has is the vehicles it has seen.
+  // Clicking it opens the newest one in the same evidence panel the feed
+  // opens -- read from the server rather than from the feed, which only holds
+  // the last eighty rows across every source.
+  const openLatestFor = useCallback(
+    async (sourceId) => {
+      const name = sourceNames.get(sourceId) || sourceId
+      try {
+        const rows = await getSightings(1, { sourceId })
+        if (rows.length === 0) {
+          say(`${name} has not seen a vehicle yet. Its sightings open here as they happen.`)
+          return
+        }
+        setSelected(rows[0])
+      } catch (error) {
+        say(error.message)
+      }
+    },
+    [say, sourceNames],
+  )
+
   const status = CONNECTION[connection] || CONNECTION.connecting
-  const selectedSighting = sightings.find((s) => s.sighting_id === selected) || null
 
   return (
     <div className="relative h-full w-full">
       <MapCanvas
         sources={sources}
         activeSourceIds={activeSourceIds}
-        onSelectSource={() => {}}
+        onSelectSource={openLatestFor}
+        here={here}
+        trails={trails}
       />
 
       {/* Nothing is placed yet, so say what places it rather than showing an
@@ -201,6 +408,25 @@ export default function LiveScreen() {
             <span className="label text-ink-mid">{status.text}</span>
           </div>
         </header>
+
+        {notice && (
+          <div className="mt-3 px-4">
+            <p className="rounded-control bg-surface-2 px-3 py-2 text-[12.5px] text-ink-mid" role="status">
+              {notice}
+            </p>
+          </div>
+        )}
+
+        {/* P9. What is being followed right now, above the feed, because a
+            follow is a live thing and the feed is a list of things that have
+            already happened. */}
+        <FollowStrip
+          follows={follows}
+          sourceNames={sourceNames}
+          onStop={stopFollow}
+          onDismiss={dismissFollow}
+          onTrace={(plate) => navigate(`/trace/${encodeURIComponent(plate)}`)}
+        />
 
         {/* Alert strip. The newest two, with the rest counted -- the whole list
             is the Alerts screen's job and a strip that grew without bound would
@@ -275,7 +501,7 @@ export default function LiveScreen() {
                     sighting={sighting}
                     sourceName={sourceNames.get(sighting.source_id) || sighting.source_id}
                     isNew={newIds.has(sighting.sighting_id)}
-                    onOpen={(row) => setSelected(row.sighting_id)}
+                    onOpen={(row) => setSelected(row)}
                   />
                 ))}
               </motion.div>
@@ -285,14 +511,15 @@ export default function LiveScreen() {
       </aside>
 
       <EvidencePanel
-        sighting={selectedSighting}
+        sighting={selected}
         sourceName={
-          selectedSighting
-            ? sourceNames.get(selectedSighting.source_id) || selectedSighting.source_id
-            : ''
+          selected ? sourceNames.get(selected.source_id) || selected.source_id : ''
         }
         onClose={() => setSelected(null)}
         onTrace={(plate) => navigate(`/trace/${encodeURIComponent(plate)}`)}
+        following={selected ? followingIdsBySighting.has(selected.sighting_id) : false}
+        onFollow={startFollow}
+        onUnfollow={(row) => stopFollow(followingIdsBySighting.get(row.sighting_id))}
       />
     </div>
   )

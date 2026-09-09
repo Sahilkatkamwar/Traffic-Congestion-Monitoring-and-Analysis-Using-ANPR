@@ -44,6 +44,11 @@ _CONFUSED_SUB = 0.35
 # matches.
 _CANDIDATE_PENALTY = 0.03
 
+# Public name for the same number, for the same reason `plate_forms` has one
+# below: P9's follow matcher scores two sightings against each other and has to
+# spend the same tie-breaker this search does. Two copies of 0.03 would drift.
+CANDIDATE_PENALTY = _CANDIDATE_PENALTY
+
 # Stage-one width. Reads of the same plate differ mostly by dropped characters,
 # and three is already generous for a ten-character plate.
 _LENGTH_WINDOW = 3
