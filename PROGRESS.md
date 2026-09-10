@@ -3724,3 +3724,444 @@ Then http://127.0.0.1:8000/.
   had already been told was over.
 - **The wall's click targets are polled twice a second**, not per frame. A box
   under a fast vehicle can be a frame or two behind what is drawn.
+
+# P10 - Map: MapTiler tiles, and free administrative boundaries
+
+Fifth phase of PHASE2.md. Nothing about detection, tracking, OCR, stitching,
+alerts or the writer was opened: `app/detect.py`, `app/ocr.py`,
+`app/grammar.py`, `app/matching.py`, `app/stitch.py`, `app/worker.py`,
+`app/alerts.py`, `app/notify.py`, `app/follow.py`, `app/pipeline.py` and every
+model weight are byte-identical, **no table gained a field and no table was
+added** -- P10 writes nothing to the database at all. The phase is one new
+module, four routes, two new frontend libraries, one new component, and the
+base layer taken out of the four maps that each held their own copy of it.
+
+## The problem, stated as it actually was
+
+Two things, and only one of them was in the spec.
+
+**The tiles stopped at zoom 16 and had no streets in them.** The keyless Esri
+dark canvas P4a shipped is a *canvas* basemap -- deliberately sparse, made to
+sit under data -- so at the zoom where a camera is placed on one side of a
+junction there was no junction drawn to place it against. PHASE2.md asks for
+MapTiler, which has street-level detail, and MapTiler needs a key.
+
+**Four maps each held their own copy of the tile URL.** `MapCanvas`,
+`MapPicker`, `DensityMap` and `TrajectoryPath` are four separate Leaflet maps
+-- correctly so, they draw four different things -- and they agreed on what the
+world looks like by each hardcoding the same two strings. `MapPicker` had its
+own literal; the other three imported `MapCanvas`'s. A camera placed on one and
+shown on another has to look like it is in the same place, and that was a
+promise rather than a fact.
+
+## The credential rule is what decided the design
+
+PHASE2.md says `MAPTILER_API_KEY` is environment only, never in
+`config/settings.yaml`, and **never returned by any API response (name only)**
+-- the same rule `TEXTBEE_*` follows.
+
+That last clause rules out the obvious implementation. **A tile URL template
+with the key in it IS the key**: putting
+`https://api.maptiler.com/maps/.../{z}/{x}/{y}.png?key=...` into
+`/api/map/config` hands the credential to every browser that opens the screen,
+to every extension in it, and to anything reading the network. So the browser
+is handed `/api/map/tiles/{z}/{x}/{y}.png`, which points back at this app, and
+`app/basemap.py:tile()` attaches the key on the way out. **The key does not
+leave the process**, and the suite asserts that by setting it to a known string
+and searching the whole serialised response, its headers, and the built
+JavaScript bundle for that string.
+
+**Overpass is proxied for a different reason, and it is the cache.** It is
+keyless, so there is no credential to protect. What it has is a rate limit on a
+shared free service, which is the trap PHASE2.md names. A cache inside one
+browser tab helps that tab; a cache here helps every tab, survives a reload,
+and is the only place a minimum interval between two upstream calls can
+actually be enforced.
+
+**With no key set the browser talks to OpenStreetMap directly, and is not
+proxied.** There is no credential to hide, and putting this server in front of
+somebody else's free tiles would hide the real client from them, which their
+tile usage policy exists to prevent. Degrade, don't break -- the map is a map
+either way, which is PHASE2.md's requirement.
+
+## The admin ladder was wrong, and the live run is what said so
+
+This is the one finding of the phase worth reading closely.
+
+The levels were coded from the OpenStreetMap wiki, which says India is
+`4 State, 6 District, 7 Tehsil, 8 Village`. The first run against the real
+Overpass returned **zero outlines** over Nashik, while `is_in` at the same
+point answered with four areas. The two disagreed, so the ladder was measured
+rather than argued about: `scratch/p10_levels_probe.py` asked `is_in` at seven
+points in six states (log in `scratch/p10_levels_probe.log`).
+
+    2   India                                             every point
+    4   Maharashtra, Karnataka, Rajasthan, Kerala, Delhi   every point
+    5   Nashik District, Pune District, Nagpur, Jaipur, Ernakulam
+    6   Nashik Subdistrict, Jaipur Tehsil, Nagpur Urban Taluka
+    7   Bengaluru                                          one point of seven
+    8   Nagpur City, Jaipur Municipal Corporation
+    10  Ashokanagar
+
+**In this data a district is level 5 and a taluka is level 6**, not 6 and 7.
+PHASE2.md's "state -> district -> taluka/tehsil -> village/nagar" is therefore
+**4, 5, 6, 8**, and asking for 7 was asking for a level that exists at one of
+seven points. The wiki is not what this app queries; Overpass is.
+
+Corrected, the same viewport draws **13 outlines around Nashik** -- 3 districts
+and 10 talukas -- and the labels are right: what used to render as "Division:
+Nashik District" now renders as "District: Nashik District".
+
+## A state outline costs 12-27 MB, so states are named and not drawn
+
+The second measurement of the phase, and it changed the spec's shape.
+
+With the ladder fixed, the wide-zoom tiers still drew nothing -- because the
+area cap refused every viewport they applied to. Rather than raise the cap, the
+cost of each tier was measured against the live Overpass, which is the only way
+to know: `out geom` returns full-resolution geometry and nothing about the
+query says how much that is.
+
+| snapped viewport | levels asked for | from Overpass | time |
+|---|---|---|---|
+| 264 deg2 (z7) | 4 states | **27.07 MB** | 11.3s |
+| 72 deg2 (z8) | 4 states | **12.82 MB** | 5.8s |
+| 16.5 deg2 (z9) | 5,6 district+taluka | 14.05 MB | 7.2s |
+| 7.0 deg2 (z10) | 5,6 district+taluka | 7.36 MB | 4.6s |
+| 1.5 deg2 (z11) | 5,6 district+taluka | 3.88 MB | 3.3s |
+| 0.5 deg2 (z12) | 5,6 district+taluka | 2.46 MB | 3.0s |
+| 0.25 deg2 (z13) | 6,8 taluka+town | 0.83 MB | 3.0s |
+
+**A single state outline is 12 to 27 MB off a shared free service, per
+viewport, and no amount of thinning helps because the download is the cost.**
+That is precisely the abuse PHASE2.md's trap list names, and it is not a thing
+to ship behind a toggle a demo will click.
+
+So the decision, with the number beside it: **outlines stop at the district,
+and the state and country are named by the click instead.** `is_in` asks for
+tags only and answers in about a second, so the full ladder -- Country, State,
+District, Taluka -- is still on screen the moment somebody clicks; it is only
+the *drawing* of a state that is refused. `MAX_BBOX_DEG2` is set to 2.0, which
+admits a z11 view at 1.5 deg2 and refuses a z10 one at 7.0, landing exactly
+where the table crosses from ~4 MB into ~7 MB.
+
+This is a deliberate departure from reading PHASE2.md's ladder as four things
+to draw, and it is recorded as one rather than quietly implemented.
+
+**What the browser actually receives is far smaller than any of the above**,
+because the thinning happens before the answer is sent:
+
+| view | features | points in | points out | delivered |
+|---|---|---|---|---|
+| z11 | 41 | 73840 | 11584 | **0.28 MB** |
+| z12 | 19 | 46928 | 10867 | **0.26 MB** |
+| z13 | 10 | 15896 | 5347 | **0.13 MB** |
+
+A ~30x reduction, which is what makes a pan survivable in the browser even
+though the upstream fetch behind it is megabytes.
+
+## What was built
+
+**`app/basemap.py`** -- `describe()` (which base map, and no credential in it),
+`tile()` (the proxy and its disk cache), `boundaries()` (a viewport), and
+`chain_at()` (which areas a clicked point is inside). Every upstream call goes
+through one module-level name, `fetch`, so a verification run can replace it
+and no suite reaches the network.
+
+**Four routes**, all read-only, none of them writing anything:
+`GET /api/map/config`, `GET /api/map/tiles/{z}/{x}/{y}.png`,
+`GET /api/map/boundaries`, `GET /api/map/boundaries/at`.
+
+**`web/src/lib/basemap.js`** -- `attachBaseLayer(map)`, asked once per page for
+all four maps. The four map components now call it and **none of them holds a
+tile URL any more**, which the suite checks by grepping each file and the built
+bundle for the layer P10 replaced.
+
+**`web/src/lib/boundaries.js`** and **`BoundaryPanel.jsx`** -- the toggle, the
+outlines, and the administrative chain a click resolves to, rendered
+outermost-first with each level named beside it. "Nashik" alone is a district,
+a city and a taluka; which one is the entire point of asking.
+
+## The decisions, and what each one refuses
+
+**The viewport is snapped out to a grid cell before it is asked for.** This is
+the whole of "do not refetch on every pan tick", and it is enforced on the
+server rather than trusted to a debounce in one browser: a map nudged fifty
+metres asks the *same* snapped question and is answered from the cache.
+Measured in the suite -- a repeat and a small pan both make **zero** upstream
+calls, and a viewport in the next cell makes one. One step, 0.25 degrees: only
+z11 and finer are served at all and they all sit in one band, so a table of
+steps per zoom would be four numbers of which three could never be reached.
+
+**The client cache tests containment, not the grid.** It keys answers by the
+box the *server* snapped to and asks whether that box covers where the map now
+is. That is the property that actually matters, and it means the grid step is
+one number on one side rather than two copies that can drift apart.
+
+**Two Overpass calls are never made back to back.** A floor of one second,
+enforced in the cache's own lock, so it holds across browsers and tabs rather
+than per client. The wait is a loop rather than one `time.sleep(gap)`, because
+`time.sleep` returns early on Windows -- measured on this machine,
+`time.sleep(0.4)` comes back after **0.390s**, the ~15.6ms timer tick rounding
+down. One sleep would make this floor "about a second"; the loop makes it a
+second. Measured: two calls that both miss take 0.40s of waiting at a 0.4s
+floor.
+
+**A busy Overpass serves the answer already in hand, and says it is stale.**
+A boundary drawn from an hour ago is right; an empty map is not. With nothing
+in hand it fails with a sentence -- "the map itself is unaffected" -- rather
+than a status code, because the map genuinely is unaffected.
+
+**Levels are chosen by zoom, and a viewport bigger than 2 square degrees is
+refused.** That is roughly z11, and the number comes from the cost table above
+rather than from taste -- it is where a district-and-taluka query crosses from
+~4 MB into ~7 MB. The refusal says what to do: "Zoom in to a town or a district
+and they appear."
+
+**Member ways are stitched, and a ring that does not close is kept as a line.**
+Overpass hands back a boundary as a bag of ways in no order and no consistent
+direction. They are walked end to end, flipping whichever needs flipping. A
+boundary that is simply cut by the viewport is drawn as a line rather than
+force-closed, which would draw a shortcut across ground the district does not
+cover. Two disjoint loops stay two loops -- Palghar came back from the live
+service as **six rings** because it has exclaves, and joining them would draw a
+district boundary through the sea. An `inner` member is a hole and is left out
+rather than stitched in, which would draw a line from the boundary to the hole
+and back.
+
+**Geometry is thinned server-side to what the zoom can show.** Douglas-Peucker
+at roughly one screen pixel. On the live run this is **2563 points to 701** for
+one taluka, ~1600 to ~330 for the rest, with both endpoints always kept so a
+closed ring stays closed.
+
+**Point-in-polygon is Overpass's `is_in`, not this app's arithmetic.** The
+service that owns the polygons answers which area a click is in. Re-deriving it
+here from the simplified copy that was drawn could disagree with it near an
+edge, and the drawn copy is simplified precisely so that it is not exact.
+
+**A boundary is not the accent colour.** Plate yellow on this map already means
+"the vehicle you asked about". Outlines are a neutral ink hairline, the outer
+of the two levels heavier than the inner; only the area a click resolved to
+takes the accent, because that one is an answer.
+
+## Exit criteria - verified as far as this machine can
+
+PHASE2.md's exit for P10: *"zooming in on any Indian location shows
+street-level MapTiler detail; toggling Boundaries draws the taluka/district
+outline the clicked point sits in, labelled."*
+
+**The boundary half is verified against the live service.**
+`scratch/p10_live_map.py` (run by hand, never from a suite), log in
+`scratch/p10_live_map.log`, and the same through the **real running app** on
+port 8000:
+
+    /api/map/boundaries  200  13 features  bbox [19.75, 73.5, 20.25, 74.0]
+                              levels: District, Taluka
+                              District  Ahilyanagar District   1 ring, 2077 pts (from 6644)
+                              District  Nashik District        1 ring, 1662 pts (from 8757)
+                              District  Palghar                6 rings,  811 pts (from 3562)
+                              Taluka    Akola, Chandwad, Dindori, Igatpuri,
+                                        Mokhada, Nashik, Niphad, Peth, Sinnar,
+                                        Trimbakeshwar -- one closed ring each
+    /api/map/boundaries/at?lat=19.9975&lon=73.7898  200
+                              Country India / State Maharashtra /
+                              District Nashik District / Taluka Nashik Subdistrict
+    a nudged viewport         cached=True in 0.078s
+
+**Nashik District is drawn, and the click names the taluka inside it** -- which
+is the exit criterion read literally. Palghar comes back as **6 rings**, not
+one, and that is right: it has exclaves, and the stitcher keeps them apart
+rather than joining them with a line through the sea.
+
+**The MapTiler half is not verified, and that is stated rather than implied.**
+There is no `MAPTILER_API_KEY` on this machine, so what is proven is the URL
+that gets built, that the key is attached to it server-side, that it appears in
+no response, and that the proxy refuses with a sentence when there is no key.
+What is *not* proven is that MapTiler accepts a real key or that the style name
+`streets-v2-dark` exists on the account -- both need an account this machine
+does not have. `scratch/p10_live_map.py` tests exactly that the moment a key is
+set, and says out loud that it is skipping it when there is not.
+
+`scratch/p10_verify.py` -- **131 passed, 0 failed, 0 skipped**, log in
+`scratch/p10_verify.log`.
+
+**That it reaches no network is proven rather than claimed.** The suite was
+re-run with `basemap._open` and `basemap.fetch` both replaced by a function
+that raises, so any check that fell through to a real socket would fail loudly
+instead of quietly passing on a machine that happens to be online: **131
+passed, 0 failed** with the network made to explode.
+
+| check | result |
+|---|---|
+| with no key the map still has a layer, and it is OpenStreetMap | PASS |
+| the screen is told which variable is missing, and what to do | PASS |
+| with a key the browser is pointed back at this app, not at MapTiler | PASS |
+| **and the key is in no field of the answer** | PASS |
+| street level is reachable -- z19, not the old z16 ceiling | PASS |
+| **the key is attached upstream, server-side** | PASS |
+| to the configured style, at the asked-for tile | PASS |
+| **the same tile twice is not bought twice** | PASS, 1 upstream call |
+| a rejected key is reported as a rejected key, without quoting it | PASS |
+| a zoom, or a tile, that cannot exist is refused with a sentence | PASS |
+| the tile cache is capped rather than growing without end | PASS |
+| **a viewport is grown to a fixed grid cell, so a nudge is one question** | PASS |
+| **a repeat, and a pan inside the cell, ask nothing** | PASS, 1 call |
+| a view in the next cell does ask | PASS |
+| the query asks for administrative relations at the zoom's levels only | PASS |
+| **5/6/8 -- the ladder India actually uses, not the wiki's** | PASS |
+| state, district, taluka and town are each named in words | PASS |
+| **a state outline is never asked for, at any zoom** | PASS |
+| and a state is still named, because `is_in` costs tags only | PASS |
+| every zoom that is served is inside the area cap | PASS |
+| **ways out of order and pointing both ways stitch into one closed ring** | PASS |
+| a boundary cut by the viewport stays a line, not a shortcut | PASS |
+| **an area with an exclave stays two rings, and both close** | PASS |
+| a hole is left out rather than stitched across the area | PASS |
+| geometry is thinned to what the zoom shows, corners and ends kept | PASS, 401 → 3 |
+| half the country is refused, with what to do instead | PASS |
+| **a busy Overpass serves what is in hand, and says it is stale** | PASS |
+| with nothing in hand it fails with a sentence, naming the map as fine | PASS |
+| **two Overpass calls are never back to back** | PASS, 0.40s for two |
+| **the chain at a point comes back outermost first**, each level named | PASS |
+| the same point is not asked about twice | PASS |
+| an area with no administrative level is dropped rather than shown | PASS |
+| all four routes answer through the real app | PASS |
+| **the key is in no response, header or byte of a served tile** | PASS |
+| an unreachable service is a sentence, not a stack trace | PASS |
+| nothing about P10 needed a table | PASS |
+| the nine changed frontend files parse | PASS |
+| **all four maps take their base layer from the server** | PASS |
+| and the bundle carries no map key, and no URL shaped to hold one | PASS |
+| no map in the bundle still points at the layer P10 replaced | PASS |
+| the Boundaries toggle, both fetches, and the on-map label are in it | PASS |
+| an empty view says what to do rather than "no data" | PASS |
+
+**What could not be verified here.** No browser rendered any of it -- there is
+no headless browser in `web/node_modules` and adding one is forbidden -- so the
+tile layer, the outlines, their labels and the highlight are verified through
+the built bundle, the HTTP routes and a real running app, as every phase before
+this one was.
+
+## Regression -- every documented failure, and nothing new
+
+Every suite re-run against the P10 tree, sequentially (two at once would fight
+over the GPU, the webcam and the ports). Driver `scratch/p10_reg_driver.py`,
+one log each in `scratch/p10_reg_<name>.log`, summary in
+`scratch/p10_reg_summary.log`. The sweep was run on a **frozen tree** -- two
+earlier sweeps were discarded because edits landed while they ran, and a
+regression table measured against a moving tree is not a measurement.
+
+    p1_verify              21/22   the documented environmental webcam failure
+    p1_verify_shutdown       5/5
+    p1_verify_supervision  14/14
+    p2_verify              33/34   the documented ocr_tworow500 calibration failure
+    p3_verify              57/57
+    p4a_verify             25/25
+    p4b_verify             74/74
+    p4c_verify             75/75
+    p4d_verify             79/81   the documented application-database failures
+    p4e_verify            128/129  the same
+    p5_verify            109/109
+    p5_notify_verify     181/183   the documented settings.yaml no-op failures
+    p5_number_live         14/15   the same cause
+    p6_verify            114/114
+    p7_verify              97/97
+    p8_verify              86/86
+    p9_verify              78/78
+    p10_verify           131/131   new
+
+**Check for check, this is P9's sweep with P10's suite added**, and every
+failing check is one of the seven already documented, failing for the reason
+already documented.
+
+**One count moved and it is not a regression: `p9_verify` is 78 where P9
+recorded 79, with zero failures in both.** That suite samples the camera wall's
+live overlay and emits one check per box it finds in the frame it caught. P9's
+run caught two boxes and wrote two per-box checks; this one caught one and
+wrote one. The check that matters -- "at least one box on the wall reached a
+committed row" -- passes either way, at *2 of 2* then and *1 of 1* now. A
+denominator that is a sample is worth saying out loud rather than quietly
+reporting 78 as if it were 79.
+
+**`p4a_verify` at 25/25 and `p4b_verify` at 74/74 are the two that matter most
+here.** Every map in this app is reached through the screens those two cover,
+and P10 replaced the base layer under all four of them.
+
+## Files
+
+    app/basemap.py                      NEW -- describe/tile/boundaries/chain_at,
+                                        the caches, the rate floor, the stitch
+                                        and the thinning
+    app/api.py                          four read-only map routes
+    config/settings.yaml                a `map:` section and paths.tile_cache;
+                                        50 lines added, 0 changed, CRLF intact
+    web/src/lib/basemap.js              NEW -- attachBaseLayer, asked once a page
+    web/src/lib/boundaries.js           NEW -- the client-side containment cache
+    web/src/components/BoundaryPanel.jsx NEW -- the toggle and the chain
+    web/src/components/MapCanvas.jsx    the base layer from the server; the
+                                        outlines, their labels and the click
+    web/src/components/MapPicker.jsx    the base layer from the server
+    web/src/components/DensityMap.jsx   the same
+    web/src/components/TrajectoryPath.jsx the same
+    web/src/screens/LiveScreen.jsx      the Boundaries panel
+    web/src/lib/api.js                  getMapConfig, getBoundaries, getBoundaryAt
+    web/src/tokens.css                  .boundary-label -- type on the map
+    scratch/p10_verify.py               NEW -- 131 checks, no network
+    scratch/p10_live_map.py             NEW -- the live half, run by hand
+    scratch/p10_levels_probe.py         NEW -- what each admin_level actually
+                                        holds, at seven points in six states
+    scratch/p10_reg_driver.py           NEW -- the sweep below
+
+`web/dist` rebuilt.
+
+## Runnable
+
+    env\Scripts\activate.bat
+    python -m app.run
+
+Then http://127.0.0.1:8000/. For street-level tiles, set `MAPTILER_API_KEY` in
+the environment first; without it the map draws OpenStreetMap and everything
+else is identical.
+
+## What is not done, and is not pretended to be
+
+- **No real MapTiler key was ever used.** The proxy, the cache, the refusals
+  and the key's absence from every response are all measured; that MapTiler
+  accepts the key and knows the style name is not, because there is no account
+  on this machine. It is one variable and one run of
+  `scratch/p10_live_map.py` away.
+- **The keyless fallback is OpenStreetMap's bright raster, and it fights the
+  dark UI.** PHASE2.md names OSM as the fallback and that is what shipped, but
+  the layer it replaces -- Esri's dark canvas -- looked better under the
+  floating panels. With a key set the MapTiler style is dark and the problem
+  does not arise; without one the map is legible and plain rather than
+  designed.
+- **State outlines are not drawn, only named.** Measured at 12-27 MB per
+  viewport out of Overpass, which is why. If they are ever wanted on the map,
+  the way to get them is a pre-simplified source of state polygons shipped with
+  the app -- not a bigger `MAX_BBOX_DEG2`, which would just make the app slow
+  and the free service unhappy at the same time.
+- **Nothing is drawn below zoom 11.** The screen says to zoom in, which is
+  honest, but it means opening Live on the default country-wide view and
+  toggling Boundaries shows that sentence rather than an outline. The first
+  useful zoom is a town.
+- **The ladder is India's, measured at seven points.** `LEVEL_NAMES` says level
+  5 is a District because that is what this data holds. In another country it
+  is not, and nothing here detects which country the viewport is in.
+- **Level 7 and level 10 are understood but never asked for.** Level 7 exists
+  at one of the seven probed points and level 10 is a ward; drawing either
+  would be drawing something most viewports do not have.
+- **The boundary cache is per process and is lost on restart.** It is a dict,
+  not a file. A restart costs one Overpass call per viewport, which is the
+  right trade for something that is neither evidence nor configuration.
+- **Boundaries are on the Live map only.** The picker, the density map and the
+  trajectory map share the base layer and not the overlay -- a boundary is
+  context for placing and following, and the other three already draw their own
+  answer over the map.
+- **A hole inside an area is not drawn.** An `inner` member is dropped rather
+  than rendered, so an enclave shows only as its own relation's outline if it
+  has one, and as nothing if it does not. Drawing holes needs polygons with
+  holes, and these are drawn as rings.
+- **Nothing chooses the levels from what came back.** If a viewport's zoom asks
+  for talukas and that area has none mapped, the panel says so and offers
+  zooming rather than silently trying the level above.

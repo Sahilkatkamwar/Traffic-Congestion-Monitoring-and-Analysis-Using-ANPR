@@ -1,17 +1,15 @@
 import { useEffect, useRef } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import { attachBaseLayer } from '../lib/basemap'
 
 // Click the map to place a source. Leaflet owns the node; React only reads the
 // coordinate back out.
 //
 // The same tiles as the Live map, because a camera placed here has to look like
-// it is in the same place when it appears there.
-
-const TILES =
-  'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}'
-const ATTRIBUTION =
-  'Tiles &copy; <a href="https://www.esri.com/">Esri</a>, &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+// it is in the same place when it appears there. P10 made that a fact rather
+// than a promise: both ask the server which base layer to draw instead of each
+// holding its own copy of a URL.
 
 const FALLBACK_CENTRE = [22.35, 78.9]
 const FALLBACK_ZOOM = 5
@@ -45,7 +43,8 @@ export default function MapPicker({ value, onPick, others = [], height = 300 }) 
       preferCanvas: true,
     }).setView(start, value?.lat != null ? PLACED_ZOOM : FALLBACK_ZOOM)
 
-    L.tileLayer(TILES, { attribution: ATTRIBUTION, maxZoom: 16 }).addTo(map)
+    let alive = true
+    attachBaseLayer(map, { alive: () => alive })
 
     // Already-placed sources, so a new camera can be put in relation to them
     // rather than onto an empty map.
@@ -74,6 +73,7 @@ export default function MapPicker({ value, onPick, others = [], height = 300 }) 
     const settle = setTimeout(() => map.invalidateSize(), 260)
 
     return () => {
+      alive = false
       clearTimeout(settle)
       map.remove()
       mapRef.current = null

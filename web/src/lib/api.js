@@ -234,3 +234,37 @@ export async function getSightingByTrack(sourceId, trackId) {
   )
   return rows[0] || null
 }
+
+// --- the map (P10) ---------------------------------------------------------
+//
+// Which base layer to draw is the server's answer, not a constant in here,
+// because it depends on whether MAPTILER_API_KEY is set on the machine serving
+// this bundle -- and the key itself never appears in the answer. When it IS
+// set, `tile_url` points back at this app, which attaches the key on the way
+// out to MapTiler; when it is not, it points straight at OpenStreetMap and the
+// map is exactly as usable.
+export const getMapConfig = () => get('/api/map/config')
+
+// Administrative outlines over one viewport. The server snaps the box out to a
+// fixed grid cell before asking Overpass, so nudging the map is the same
+// question and is answered from its cache rather than from the public service.
+export const getBoundaries = ({ south, west, north, east, zoom }) =>
+  get(
+    '/api/map/boundaries?' +
+      new URLSearchParams({
+        south: south.toFixed(5),
+        west: west.toFixed(5),
+        north: north.toFixed(5),
+        east: east.toFixed(5),
+        zoom: String(Math.round(zoom)),
+      }).toString(),
+  )
+
+// Which areas one clicked point sits inside, outermost first. Overpass's own
+// is_in answers it, so the service that owns the polygons decides -- not this
+// bundle re-testing the simplified copy it was handed.
+export const getBoundaryAt = (lat, lon) =>
+  get(
+    '/api/map/boundaries/at?' +
+      new URLSearchParams({ lat: lat.toFixed(6), lon: lon.toFixed(6) }).toString(),
+  )

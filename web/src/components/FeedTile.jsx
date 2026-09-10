@@ -23,7 +23,7 @@ import { getStreamBoxes, streamUrl } from '../lib/api'
 // the click targets under a moving vehicle without a request per frame.
 const BOXES_EVERY_MS = 500
 
-export default function FeedTile({ source, onOpenSource, onOpenBox }) {
+export default function FeedTile({ source, onOpenSource, onOpenBox, compact = false }) {
   const [nonce, setNonce] = useState(() => Date.now())
   const [state, setState] = useState('connecting')
   const [boxes, setBoxes] = useState([])
@@ -98,7 +98,16 @@ export default function FeedTile({ source, onOpenSource, onOpenBox }) {
   }, [running])
 
   return (
-    <figure className="overflow-hidden rounded-card bg-surface-1 shadow-lift">
+    <figure
+      className={
+        // `compact` is for a tile that already sits on a surface -- the Live
+        // screen's floating panel -- where a second card background and a
+        // second shadow would be one elevation too many.
+        compact
+          ? 'overflow-hidden rounded-control'
+          : 'overflow-hidden rounded-card bg-surface-1 shadow-lift'
+      }
+    >
       <div className="relative aspect-video bg-[#0a0d12]">
         {running ? (
           <img
@@ -169,11 +178,16 @@ export default function FeedTile({ source, onOpenSource, onOpenBox }) {
         )}
       </div>
 
-      <figcaption className="flex items-center justify-between gap-3 px-3 py-2.5">
+      <figcaption
+        className={`flex items-center justify-between gap-3 py-2.5 ${
+          compact ? 'px-1' : 'px-3'
+        }`}
+      >
         <button
           type="button"
           onClick={() => onOpenSource?.(source)}
-          className="min-w-0 rounded-control text-left"
+          disabled={!onOpenSource}
+          className="min-w-0 rounded-control text-left disabled:cursor-default"
         >
           <span className="block truncate text-[13.5px] font-semibold">{source.name}</span>
           <span className="block truncate text-[11.5px] tabular-nums text-ink-low">

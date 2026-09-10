@@ -44,6 +44,7 @@ from app import (
     alerts as alert_rules,
     analytics,
     analyze as analysis,
+    basemap,
     config,
     db,
     follow as follow_rules,
@@ -466,6 +467,79 @@ def create_app(pipeline=None):
                 f"file is not open in another program and not read-only.",
             )
         return _notifier().describe()
+
+    # ------------------------------------------------------------- map (P10)
+
+    @app.get("/api/map/config")
+    def map_config():
+        """Which base map the browser should draw, and what to say about it.
+
+        Read-only, and it never returns a credential -- only whether one is
+        set and the NAME of the variable it is read from, the same shape
+        /api/notifications already answers in. When a key IS set the tile URL
+        in here points back at this app rather than at MapTiler, because a
+        template with the key in it would be the key.
+        """
+        return basemap.describe()
+
+    @app.get("/api/map/tiles/{z}/{x}/{y}.png")
+    def map_tile(z: int, x: int, y: int):
+        """One base-map tile, fetched with the key attached server-side.
+
+        The whole reason this route exists: it is what keeps MAPTILER_API_KEY
+        out of the browser. With no key set the frontend never asks here at
+        all -- it points straight at OpenStreetMap -- so a request arriving
+        here without one is answered with the sentence that says so.
+        """
+        try:
+            payload, content_type, cached = basemap.tile(z, x, y)
+        except basemap.UpstreamError as exc:
+            return fail(502, str(exc))
+        return Response(
+            content=payload,
+            media_type=content_type,
+            headers={
+                # A base-map tile for a fixed style is the same tile tomorrow.
+                "Cache-Control": "public, max-age=604800",
+                "X-Tile-Cache": "hit" if cached else "miss",
+            },
+        )
+
+    @app.get("/api/map/boundaries")
+    def map_boundaries(
+        south: float = Query(..., ge=-90, le=90),
+        west: float = Query(..., ge=-180, le=180),
+        north: float = Query(..., ge=-90, le=90),
+        east: float = Query(..., ge=-180, le=180),
+        zoom: float = Query(11, ge=0, le=22),
+    ):
+        """Administrative outlines over one viewport, from Overpass.
+
+        The viewport is snapped out to a fixed grid cell before it is asked
+        for, so a small pan is the same question and is answered from the
+        cache rather than from the public service -- PHASE2.md's trap about
+        the rate limit, handled where every browser goes through it.
+        """
+        try:
+            return basemap.boundaries(south, west, north, east, zoom)
+        except basemap.UpstreamError as exc:
+            return fail(502, str(exc))
+
+    @app.get("/api/map/boundaries/at")
+    def map_boundary_at(
+        lat: float = Query(..., ge=-90, le=90),
+        lon: float = Query(..., ge=-180, le=180),
+    ):
+        """Which administrative areas one clicked point sits inside.
+
+        Overpass's own `is_in`, so the service that owns the polygons answers
+        the point-in-polygon question rather than this app re-deriving it from
+        the simplified copy it drew -- which could disagree near an edge.
+        """
+        try:
+            return basemap.chain_at(lat, lon)
+        except basemap.UpstreamError as exc:
+            return fail(502, str(exc))
 
     # -------------------------------------------------------- sources (P4b)
 

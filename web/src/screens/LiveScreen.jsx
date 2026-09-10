@@ -4,8 +4,10 @@ import MapCanvas from '../components/MapCanvas'
 import SightingCard from '../components/SightingCard'
 import EvidencePanel from '../components/EvidencePanel'
 import FollowStrip from '../components/FollowStrip'
+import BoundaryPanel from '../components/BoundaryPanel'
+import LiveCameras from '../components/LiveCameras'
 import Empty from '../components/Empty'
-import { getAlerts, getSightings, getSources } from '../lib/api'
+import { getAlerts, getSightingByTrack, getSightings, getSources } from '../lib/api'
 import { openLiveFeed } from '../lib/socket'
 import { Link, useRoute } from '../lib/router'
 
@@ -48,6 +50,11 @@ export default function LiveScreen() {
   // server holds the same set on the connection; this is the drawing of it.
   const [follows, setFollows] = useState([])
   const [here, setHere] = useState(null)
+  // P10. The administrative outlines, and what the map last said about them.
+  // Off when the screen opens: it costs a call to a public service and it is
+  // context rather than the job, so it is asked for rather than assumed.
+  const [boundaries, setBoundaries] = useState(false)
+  const [boundaryStatus, setBoundaryStatus] = useState(null)
 
   const pulseTimers = useRef(new Map())
   const feedRef = useRef(null)
@@ -360,6 +367,27 @@ export default function LiveScreen() {
     [say, sourceNames],
   )
 
+  // A box on the live feed is a vehicle the worker is tracking right now. Its
+  // row is written when the track ends, so a vehicle still in frame honestly
+  // has nothing to open yet and the panel says that rather than showing an
+  // empty evidence sheet.
+  const openBox = useCallback(
+    async (source, box) => {
+      try {
+        const row = await getSightingByTrack(source.source_id, box.track_id)
+        if (row) setSelected(row)
+        else
+          say(
+            `${box.vehicle_type} #${box.track_id} is still in frame at ${source.name}. ` +
+              'Its evidence is written when it leaves.',
+          )
+      } catch (error) {
+        say(error.message)
+      }
+    },
+    [say],
+  )
+
   const status = CONNECTION[connection] || CONNECTION.connecting
 
   return (
@@ -370,7 +398,26 @@ export default function LiveScreen() {
         onSelectSource={openLatestFor}
         here={here}
         trails={trails}
+        boundaries={boundaries}
+        onBoundaries={setBoundaryStatus}
       />
+
+      {/* Under the zoom control, opposite the feed: this is a setting for the
+          map behind the screen, not part of the screen's own work. */}
+      <div className="absolute right-4 top-[6.5rem] z-[600]">
+        <BoundaryPanel
+          on={boundaries}
+          onToggle={(next) => {
+            setBoundaries(next)
+            if (!next) setBoundaryStatus(null)
+          }}
+          status={boundaryStatus}
+        />
+      </div>
+
+      {/* The running camera itself, bottom right, clear of the attribution.
+          The map says where a camera is; this says what it is looking at. */}
+      <LiveCameras sources={sources} onOpenBox={openBox} />
 
       {/* Nothing is placed yet, so say what places it rather than showing an
           empty map with no explanation. */}
@@ -489,6 +536,8 @@ export default function LiveScreen() {
               action={
                 sources.length === 0
                   ? 'Add a camera or a recorded video in Sources to start reading plates.'
+                  : runningCount > 0
+                  ? `${runningCount} source${runningCount === 1 ? ' is' : 's are'} running. The first vehicle they see appears here — watch the camera panel to see what they are looking at.`
                   : 'Sources exist but none is running. Start one in Sources and sightings appear here as they happen.'
               }
             />

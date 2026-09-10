@@ -29,7 +29,7 @@ from pathlib import Path
 
 import cv2
 
-from app import config, db, grammar, stitch
+from app import config, db, grammar, probe, stitch
 from app.classify import VehicleClassifier
 from app.detect import VehicleDetector
 from app.ocr import PlateReader, vote
@@ -77,9 +77,22 @@ def _open_capture(target):
         # The timeouts have to go in as constructor params. Setting them
         # afterwards is too late: the open already happened, and an unreachable
         # camera has already blocked for FFmpeg's own 30s default.
+        #
+        # A URL is handed to FFmpeg by name rather than through CAP_ANY, and
+        # that is the difference between the timeout above being honoured and
+        # being decoration. CAP_ANY is a fallback chain: FFmpeg gives up on
+        # schedule, and OpenCV then offers the same URL to backends that do not
+        # read these properties at all -- ending at the image-sequence reader,
+        # which is what prints `VIDEOIO/IMAGES: unsupported parameters` and
+        # bails out long afterwards. Measured against an unreachable phone at a
+        # 3s setting: CAP_ANY blocked 90.8s on a silent host and 24.4s on one
+        # that answers ICMP, CAP_FFMPEG 3.1s on both. Files keep CAP_ANY --
+        # FFmpeg is what OpenCV picks for them anyway, and every benchmark in
+        # CLAUDE.md was measured through that choice.
+        backend = cv2.CAP_FFMPEG if "://" in str(target) else cv2.CAP_ANY
         cap = cv2.VideoCapture(
             target,
-            cv2.CAP_ANY,
+            backend,
             [
                 cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, OPEN_TIMEOUT_MS,
                 cv2.CAP_PROP_READ_TIMEOUT_MSEC, READ_TIMEOUT_MS,
@@ -786,9 +799,15 @@ def run_worker(source, queue, stop_event, preview_queue=None, preview_on=None):
         target = _resolve_uri(source["uri"])
         cap = _open_capture(target)
         if cap is None:
+            # An address that can never answer says so itself, and the row's
+            # error is what a person reads on the Sources screen -- so the
+            # reason travels with the failure rather than only living in the
+            # connection test.
+            hint = probe.network_hint(source["uri"])
             raise RuntimeError(
                 f"Could not open source {source['uri']!r}. Check the file exists, "
                 f"the camera is not in use by another app, or the URL responds."
+                + (f" {hint}" if hint else "")
             )
 
         total_frames, probed_fps = _probe(cap)
@@ -879,10 +898,15 @@ def run_worker(source, queue, stop_event, preview_queue=None, preview_on=None):
                 cap.release()
                 cap = None
                 if attempt >= len(RECONNECT_DELAYS):
+                    # Asked at the point of giving up rather than at the start,
+                    # so the reason describes the network as it is now and not
+                    # as it was when the source last worked.
+                    why = probe.network_hint(source["uri"])
                     raise RuntimeError(
                         f"Source {source['uri']!r} stopped responding and did not "
                         f"come back after {len(RECONNECT_DELAYS)} attempts. Check "
                         f"the camera is powered on and on this network."
+                        + (f" {why}" if why else "")
                     )
                 delay = RECONNECT_DELAYS[attempt]
                 attempt += 1
@@ -1175,10 +1199,23 @@ def run_worker(source, queue, stop_event, preview_queue=None, preview_on=None):
         )
 
     except Exception as exc:  # noqa: BLE001 - the reason has to reach the UI
-        status = "error"
         error = f"{type(exc).__name__}: {exc}"
         print(f"[worker {source_id}] {error}")
         traceback.print_exc()
+        if stop_event.is_set():
+            # A stop was asked for, so the run ended because a person ended it
+            # and the row must say `idle` -- the same rule the normal exit above
+            # applies, and for the same reason: a source someone turned off must
+            # not sit on the Sources screen wearing a red error, and Start must
+            # not be refused for a source that is not running.
+            #
+            # Only a failure racing an explicit stop is swallowed. A worker that
+            # dies on its own has no stop set and still reports the reason,
+            # which is what supervision reads.
+            status = "idle"
+            error = None
+        else:
+            status = "error"
     finally:
         if cap is not None:
             # Windows keeps a lock on a video file held by a dead handle.

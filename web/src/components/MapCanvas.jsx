@@ -2,21 +2,19 @@ import { useEffect, useRef } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { hereIcon, markerIcon, markerPopup } from './CameraMarker'
+import { attachBaseLayer } from '../lib/basemap'
+import { loadBoundaries } from '../lib/boundaries'
+import { getBoundaryAt } from '../lib/api'
 
 // Leaflet directly, driven from an effect. Leaflet owns the DOM node and React
 // never touches it -- the two only meet through the marker table below.
 //
-// Dark tiles, because the base surface is a deep slate and a bright basemap
-// would fight every panel floating over it.
-//
-// Esri's dark canvas, not CARTO's: cartocdn still serves without a key but now
-// stamps every tile with "API KEY REQUIRED", which is someone else's watermark
-// across our evidence. This one is keyless and unbranded. Note the {z}/{y}/{x}
-// order -- Esri puts row before column, the reverse of the usual slippy URL.
-export const TILES =
-  'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}'
-export const ATTRIBUTION =
-  'Tiles &copy; <a href="https://www.esri.com/">Esri</a>, &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+// P10 took the base layer out of this file. Which tiles get drawn depends on
+// whether MAPTILER_API_KEY is set on the machine serving the bundle, which is
+// something only the server knows, so `attachBaseLayer` asks it -- once per
+// page, for all four maps in the app. The key itself never reaches here: when
+// there is one, the tile URL points back at the app and it attaches the key on
+// the way out.
 
 // Centre of India, wide zoom. Only used until a source has coordinates -- the
 // moment one does, the map fits to what actually exists.
@@ -34,12 +32,42 @@ const TRAIL_STYLE = {
   lineCap: 'round',
 }
 
+// P10's administrative outlines. Deliberately NOT the accent: a boundary is
+// context, not an answer, and plate yellow on this map already means "the
+// vehicle you asked about". The outer of the two levels on screen is drawn
+// heavier than the inner one, so a district reads as containing its talukas
+// without needing a legend.
+const BOUNDARY_STYLE = {
+  color: '#8fa3b8',
+  weight: 1.1,
+  opacity: 0.5,
+  fill: false,
+  interactive: false,
+}
+const OUTER_BOUNDARY_STYLE = { ...BOUNDARY_STYLE, weight: 2, opacity: 0.65 }
+// The one the clicked point sits in. This IS an answer, so it takes the accent.
+const BOUNDARY_SELECTED_STYLE = {
+  color: 'var(--plate-yellow)',
+  weight: 2.5,
+  opacity: 0.95,
+  fill: true,
+  fillColor: 'var(--plate-yellow)',
+  fillOpacity: 0.06,
+  interactive: false,
+}
+
+// A pan fires `moveend` more than once as it settles, and a zoom fires it
+// again. Long enough to ask one question per gesture rather than five.
+const MOVE_SETTLE_MS = 400
+
 export default function MapCanvas({
   sources,
   activeSourceIds,
   onSelectSource,
   here = null,
   trails = [],
+  boundaries = false,
+  onBoundaries = null,
 }) {
   const containerRef = useRef(null)
   const mapRef = useRef(null)
@@ -47,6 +75,12 @@ export default function MapCanvas({
   const hereRef = useRef(null)
   const trailsRef = useRef(new Map())
   const fittedRef = useRef(false)
+  const boundaryLayerRef = useRef(null)
+  const boundaryPickRef = useRef(null)
+  const boundaryOnRef = useRef(boundaries)
+  const reportRef = useRef(onBoundaries)
+  boundaryOnRef.current = boundaries
+  reportRef.current = onBoundaries
 
   useEffect(() => {
     const map = L.map(containerRef.current, {
@@ -60,10 +94,12 @@ export default function MapCanvas({
 
     L.control.zoom({ position: 'topright' }).addTo(map)
 
-    L.tileLayer(TILES, { attribution: ATTRIBUTION, maxZoom: 16 }).addTo(map)
+    let alive = true
+    attachBaseLayer(map, { alive: () => alive })
     mapRef.current = map
 
     return () => {
+      alive = false
       map.remove()
       mapRef.current = null
       markersRef.current.clear()
@@ -184,6 +220,162 @@ export default function MapCanvas({
       }
     }
   }, [trails])
+
+  // P10. Administrative outlines for whatever is on screen, and the one the
+  // clicked point sits inside.
+  //
+  // Drawn only while the toggle is on, refetched only when the map settles,
+  // and answered from a cache when the box already in hand covers where the
+  // map now is -- the Overpass instance behind this is a shared free service
+  // and a request per pan tick is what exhausts it.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return undefined
+
+    const clear = () => {
+      boundaryLayerRef.current?.remove()
+      boundaryLayerRef.current = null
+      boundaryPickRef.current?.remove()
+      boundaryPickRef.current = null
+    }
+
+    if (!boundaries) {
+      clear()
+      return undefined
+    }
+
+    let alive = true
+    let timer = null
+    // What is currently drawn, so a click can find the outline for the area it
+    // landed in without asking for the geometry a second time.
+    let drawn = null
+
+    const draw = (data) => {
+      if (!alive) return
+      drawn = data
+      boundaryLayerRef.current?.remove()
+      const group = L.layerGroup()
+      // The outer of the two levels on screen -- the smaller admin_level -- is
+      // the containing one, and is drawn heavier, so a district reads as
+      // holding its talukas without needing a legend.
+      const outermost = data.features.reduce(
+        (lowest, feature) =>
+          lowest === null || Number(feature.admin_level) < lowest
+            ? Number(feature.admin_level)
+            : lowest,
+        null,
+      )
+      for (const feature of data.features) {
+        const style =
+          Number(feature.admin_level) === outermost
+            ? OUTER_BOUNDARY_STYLE
+            : BOUNDARY_STYLE
+        let labelled = false
+        for (const ring of feature.rings) {
+          const line = L.polyline(ring.points, style)
+          group.addLayer(line)
+          if (!labelled && ring.points.length > 2) {
+            labelled = true
+            line.bindTooltip(feature.name, {
+              permanent: true,
+              direction: 'center',
+              className: 'boundary-label',
+              // A label under the cursor must not eat a click meant for the
+              // map: the click is how you ask which area you are in.
+              interactive: false,
+            })
+          }
+        }
+      }
+      group.addTo(map)
+      boundaryLayerRef.current = group
+      reportRef.current?.({
+        state: data.features.length ? 'ready' : 'empty',
+        levels: data.level_labels,
+        count: data.features.length,
+        stale: data.stale,
+      })
+    }
+
+    const refresh = () => {
+      const bounds = map.getBounds()
+      reportRef.current?.({ state: 'loading' })
+      loadBoundaries(
+        {
+          south: bounds.getSouth(),
+          west: bounds.getWest(),
+          north: bounds.getNorth(),
+          east: bounds.getEast(),
+        },
+        map.getZoom(),
+      )
+        .then(draw)
+        .catch((error) => {
+          if (!alive) return
+          // The boundaries failed. The map did not, and it is left exactly as
+          // it is -- the sentence the server wrote says which of the two
+          // happened and what to do about it.
+          reportRef.current?.({ state: 'error', detail: error.message })
+        })
+    }
+
+    const settle = () => {
+      clearTimeout(timer)
+      timer = setTimeout(refresh, MOVE_SETTLE_MS)
+    }
+
+    const identify = (event) => {
+      const { lat, lng } = event.latlng
+      reportRef.current?.({ state: 'identifying' })
+      getBoundaryAt(lat, lng)
+        .then((answer) => {
+          if (!alive || !boundaryOnRef.current) return
+          reportRef.current?.({ state: 'at', point: [lat, lng], areas: answer.areas })
+          boundaryPickRef.current?.remove()
+          boundaryPickRef.current = null
+          // Highlight the innermost area the click landed in, when its outline
+          // is one of the ones on screen. When it is not -- the click was in a
+          // village this zoom does not draw -- the panel still names it and
+          // nothing is highlighted, rather than something else being
+          // highlighted in its place.
+          const innermost = answer.areas[answer.areas.length - 1]
+          const match = innermost
+            ? (drawn?.features || []).find(
+                (feature) =>
+                  feature.name === innermost.name &&
+                  feature.admin_level === innermost.admin_level,
+              )
+            : null
+          if (!match) return
+          const group = L.layerGroup()
+          for (const ring of match.rings) {
+            group.addLayer(
+              ring.closed
+                ? L.polygon(ring.points, BOUNDARY_SELECTED_STYLE)
+                : L.polyline(ring.points, BOUNDARY_SELECTED_STYLE),
+            )
+          }
+          group.addTo(map)
+          boundaryPickRef.current = group
+        })
+        .catch((error) => {
+          if (!alive) return
+          reportRef.current?.({ state: 'error', detail: error.message })
+        })
+    }
+
+    map.on('moveend', settle)
+    map.on('click', identify)
+    refresh()
+
+    return () => {
+      alive = false
+      clearTimeout(timer)
+      map.off('moveend', settle)
+      map.off('click', identify)
+      clear()
+    }
+  }, [boundaries])
 
   return <div ref={containerRef} className="absolute inset-0" aria-label="Source map" />
 }

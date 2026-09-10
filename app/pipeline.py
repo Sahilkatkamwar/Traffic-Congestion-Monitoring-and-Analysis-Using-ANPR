@@ -38,6 +38,7 @@ unchanged.
 
 import multiprocessing as mp
 import queue as queue_mod
+import sqlite3
 import threading
 import time
 
@@ -204,7 +205,7 @@ class Pipeline:
                 if source_id in self.terminal:
                     proc[0].join(EXIT_GRACE_SEC)
                 if proc[0].is_alive():
-                    return False, f"{source_id} is already running"
+                    return False, f"{self._name_of(source_id)} is already running"
 
             conn = db.connect()
             try:
@@ -237,7 +238,19 @@ class Pipeline:
             self.deaths.pop(source_id, None)
             self.counts[source_id] = 0
             print(f"[pipeline] started worker for {source_id} (pid {process.pid})")
-            return True, f"Started {source_id}"
+        # A worker takes seconds to reach its first status message: it opens the
+        # source, probes it, and loads three models before it says anything at
+        # all, and on an unreachable camera the open alone is the 8s timeout.
+        # Until then the row keeps whatever it said before -- `idle`, because
+        # the start route clears it -- so the screen goes on offering Start for
+        # a source that is already starting, and refuses the second press with
+        # "already running" for something it is showing as idle.
+        #
+        # The process exists, so `running` is the true thing to say. If it then
+        # fails to open, the worker's own error status lands after this and
+        # carries the reason.
+        self._mark_started(source_id)
+        return True, f"Started {source_id}"
 
     def stop_source(self, source_id, timeout=10.0):
         """Ask a worker to stop, then make sure it did."""
@@ -259,6 +272,19 @@ class Pipeline:
             # a live feed any more. Better an honest gap than a frozen picture
             # that looks like a running camera.
             self.previews.pop(source_id, None)
+        # A worker terminated mid-read never sent its own final status -- it
+        # was inside cv2's grab or its reconnect wait when it was killed -- and
+        # nothing else corrects the row, because the supervisor only watches
+        # processes still in `self.procs` and this one has just been popped.
+        # The row then goes on saying `running` for a process that is gone, and
+        # the source list, the camera wall and the Live camera panel all
+        # believe it while /stream.mjpg refuses with "not running".
+        #
+        # `if_still_running` is what keeps this honest: the message lands after
+        # anything the worker did manage to send, and applies only if the row
+        # still claims to be running -- so a real `done`, or an `error` with
+        # its reason, is never overwritten by this.
+        self._mark_stopped(source_id)
         return True, f"Stopped {source_id}"
 
     def shutdown(self):
@@ -569,6 +595,18 @@ class Pipeline:
             stored = self._emit_sighting(conn, sid, row["track_id"], new=True)
             self._raise_alerts(conn, stored)
         elif kind == "status":
+            if message.get("if_still_running"):
+                # See stop_source. Only corrects a row nothing else corrected.
+                current = conn.execute(
+                    "SELECT status FROM sources WHERE source_id = ?",
+                    (message["source_id"],),
+                ).fetchone()
+                if current is None or current["status"] != "running":
+                    return
+                print(
+                    f"[writer] {message['source_id']} stopped without reporting "
+                    f"it; recording idle"
+                )
             conn.execute(
                 "UPDATE sources SET status = ?, error = ?, progress = ?, "
                 "fps = COALESCE(?, fps) WHERE source_id = ?",
@@ -625,6 +663,41 @@ class Pipeline:
                 print(f"[supervisor] {source_id}: {reason}")
                 self._mark_error(source_id, reason)
         print("[supervisor] stopped")
+
+    def _name_of(self, source_id):
+        """The name a person gave this source, for a message they will read."""
+        try:
+            conn = db.connect()
+            try:
+                row = conn.execute(
+                    "SELECT name FROM sources WHERE source_id = ?", (source_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return source_id
+        return row["name"] if row is not None and row["name"] else source_id
+
+    def _mark_started(self, source_id):
+        """Record `running` as soon as the worker process exists."""
+        try:
+            self.queue.put_nowait(
+                {"type": "status", "source_id": source_id, "status": "running",
+                 "error": None, "fps": None, "progress": None}
+            )
+        except queue_mod.Full:
+            print(f"[pipeline] queue full, could not record start for {source_id}")
+
+    def _mark_stopped(self, source_id):
+        """Write `idle` for a worker that was stopped without reporting it."""
+        try:
+            self.queue.put_nowait(
+                {"type": "status", "source_id": source_id, "status": "idle",
+                 "error": None, "fps": None, "progress": None,
+                 "terminal": True, "if_still_running": True}
+            )
+        except queue_mod.Full:
+            print(f"[pipeline] queue full, could not record stop for {source_id}")
 
     def _mark_error(self, source_id, reason):
         """Write the failure through the writer, not from this thread."""

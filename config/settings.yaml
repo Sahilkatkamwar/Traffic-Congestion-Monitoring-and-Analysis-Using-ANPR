@@ -77,10 +77,60 @@ paths:
   # deleted with the job. Kept out of crops/ for exactly that reason -- a crop
   # under crops/evidence is a row's evidence and this is not.
   analyze:        data/analyze
+  # P10. Base-map tiles fetched from MapTiler on the browser's behalf, kept so
+  # the same tile is not bought twice. Disposable: delete the directory and the
+  # map still works, it just refetches. Nothing here is evidence.
+  tile_cache:     data/tilecache
 
 server:
   host: 127.0.0.1
   port: 8000
+
+# --- the map ----------------------------------------------------------------
+# P10. Street-level tiles from MapTiler, and administrative boundaries -- state,
+# district, taluka, village -- from OpenStreetMap's Overpass API.
+#
+# NO CREDENTIAL GOES IN THIS FILE. This file is in git. The map key is read from
+# the environment:
+#
+#   MAPTILER_API_KEY    the key from the MapTiler account dashboard
+#
+# and it is never sent to a browser: the tile URL the frontend is given points
+# back at this app, which attaches the key itself. A tile URL template with the
+# key in it IS the key, and putting one in an API response hands it to everybody
+# who opens the screen.
+#
+# With the variable unset the map still works -- it draws plain OpenStreetMap
+# raster tiles, fetched by the browser directly, because there is no credential
+# to hide and proxying somebody else's free tiles would hide the real client
+# from them. Degrade, don't break, the same as the webcam check.
+#
+# Overpass is keyless and free, and the numbers below are all about not abusing
+# it: a viewport is snapped out to a grid cell before it is asked for, the
+# answer is kept for `boundary_ttl_seconds`, and two calls are never made closer
+# together than `boundary_min_interval_seconds`.
+map:
+  # Any MapTiler raster style. Dark on purpose: the base surface is a deep slate
+  # and a bright basemap fights every panel floating over it.
+  style: streets-v2-dark
+  # Tiles already fetched are kept on disk. false fetches every time.
+  tile_cache: true
+  # The oldest are dropped once there are this many. A tile costs a refetch and
+  # nothing else, so this is a cap rather than a careful policy.
+  tile_cache_max: 4000
+  # Seconds to wait on MapTiler for one tile.
+  timeout_seconds: 20
+  # The public Overpass instance. Point this at your own if you run one.
+  overpass_url: https://overpass-api.de/api/interpreter
+  overpass_timeout_seconds: 40
+  # How long one viewport's boundaries are kept. An administrative boundary
+  # moves on the order of years, so six hours is short rather than bold.
+  boundary_ttl_seconds: 21600
+  # The floor between two calls to Overpass, from anywhere in this app. It is
+  # what the public instance asks for, and it is also what stops a fast pan
+  # becoming a burst on the days every box misses the cache.
+  boundary_min_interval_seconds: 1.0
+
 
 # --- control-room SMS -------------------------------------------------------
 # One phone number, notified when a blacklisted plate is actually seen. This is

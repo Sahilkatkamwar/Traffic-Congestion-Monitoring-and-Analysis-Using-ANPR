@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import { ATTRIBUTION, TILES } from './MapCanvas'
+import { attachBaseLayer } from '../lib/basemap'
 import { bendPath } from '../lib/insights'
 
 // Where the traffic was, and where it went next.
@@ -198,10 +198,16 @@ export default function DensityMap({ heat, flows, showHeat, showFlows }) {
       preferCanvas: true,
     }).setView([22.35, 78.9], 5)
     L.control.zoom({ position: 'topright' }).addTo(map)
-    L.tileLayer(TILES, { attribution: ATTRIBUTION, maxZoom: 18 }).addTo(map)
+    // P10. Which tiles, and their attribution, is the server's answer -- it is
+    // the only side that knows whether a map key is set. `alive` is why the
+    // teardown below sets it: a screen navigated away from before the answer
+    // lands must not have a layer added to a map that no longer exists.
+    let alive = true
+    attachBaseLayer(map, { alive: () => alive })
     layerRef.current = L.layerGroup().addTo(map)
     mapRef.current = map
     return () => {
+      alive = false
       map.remove()
       mapRef.current = null
       layerRef.current = null
